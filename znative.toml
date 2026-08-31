@@ -1,0 +1,7 @@
+[plugin]
+name = "zwire"
+version = "0.1.0"
+description = "drive the zwire browser from the shell (tabs, windows, scheme, live page reads)"
+
+[native]
+lib = "zwire"    # produces libzwire.{dylib,so}
