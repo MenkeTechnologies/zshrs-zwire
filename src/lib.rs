@@ -1258,6 +1258,13 @@ const SUBS: &[Sub] = &[
     /* ---- PTY ---- */
     st(
         "pty",
+        "run",
+        "pty_spawn",
+        &["run"],
+        "spawn a terminal, type one command into it, and stream its output",
+    ),
+    st(
+        "pty",
         "spawn",
         "pty_spawn",
         &[],
@@ -1726,12 +1733,19 @@ fn open_socket(
     let wait = Duration::from_millis(ms);
     let _ = stream.set_read_timeout(Some(wait));
     let _ = stream.set_write_timeout(Some(wait));
+    send_on(&stream, msg)?;
+    Ok(stream)
+}
+
+/// Write one more message on an open socket — what a multi-frame conversation
+/// (`pty run`: spawn, then type) needs.
+#[cfg(unix)]
+fn send_on(stream: &std::os::unix::net::UnixStream, msg: &Value) -> Result<(), String> {
     let mut w = stream.try_clone().map_err(|e| e.to_string())?;
     let mut line = serde_json::to_vec(msg).map_err(|e| e.to_string())?;
     line.push(b'\n');
     w.write_all(&line).map_err(|e| e.to_string())?;
-    w.flush().map_err(|e| e.to_string())?;
-    Ok(stream)
+    w.flush().map_err(|e| e.to_string())
 }
 
 /// Fall back to the bundled client binary. `zwire-host call` prints the reply
@@ -1769,38 +1783,85 @@ fn read_reply<I: Iterator<Item = String>>(lines: I, id: u64) -> Result<Value, St
     fallback.ok_or_else(|| "no reply from zwire-host".to_string())
 }
 
-/// Run a streaming command: print every frame, one compact JSON object per line,
-/// until `secs` elapses or the host hangs up.
+/// Run a streaming command on ONE connection: send every message in `msgs`, then
+/// print each frame that comes back, one compact JSON object per line, until
+/// `secs` elapses or the host hangs up.
 ///
-/// Streams are only served by a connection that stays open, so this one holds
-/// the socket itself instead of going through [`request`]. The daemon socket is
-/// preferred here: the bus dispatcher answers a frame and moves on, so a
-/// subscription placed through it would never deliver anything.
-fn stream(host: &Host, mut msg: Value, secs: u64) -> c_int {
+/// Several messages, one connection, on purpose. A stream, a subscription and a
+/// PTY all belong to the connection that asked for them (h: `zbus::serve_conn`
+/// gives each bus connection its own `Session`, dropped when it hangs up), so
+/// `pty run` — spawn, then type into it, then read the output — is only possible
+/// while the socket stays open. A second `zwire` invocation is a second session
+/// and would find no terminal there.
+///
+/// Any endpoint serves this: the bus wraps a stream frame as
+/// `{"t":"event","value":…}` and its reply as `{"t":"reply",…,"value":…}`, both
+/// of which are unwrapped here so the output is the same on every transport.
+fn stream(host: &Host, msgs: Vec<Value>, secs: u64) -> c_int {
     #[cfg(unix)]
     {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        if let Some(o) = msg.as_object_mut() {
-            o.insert("id".into(), json!(id));
-        }
-        let daemon = socket_path(host);
-        if !daemon.exists() {
-            return fail("streaming needs the NDJSON daemon: run `zwire-host serve`");
-        }
+        // Streams take the NDJSON daemon first when there is one. Every endpoint
+        // serves them on a current host, but the browser-attached process is
+        // whatever binary the app bundles, which may be older than the bus's
+        // session rework — the daemon is the one the user started deliberately.
+        let mut order = vec![(socket_path(host), false)];
+        order.extend(
+            endpoints(host)
+                .into_iter()
+                .filter(|(p, _)| *p != socket_path(host)),
+        );
+        let Some((path, is_bus)) = order.into_iter().find(|(p, _)| p.exists()) else {
+            return fail("no zwire-host endpoint: is the browser running?");
+        };
+        let framed: Vec<Value> = msgs
+            .into_iter()
+            .map(|mut m| {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                if let Some(o) = m.as_object_mut() {
+                    o.insert("id".into(), json!(id));
+                }
+                if is_bus {
+                    bus_frame(&m, id)
+                } else {
+                    m
+                }
+            })
+            .collect();
+        let Some((first, rest)) = framed.split_first() else {
+            return 0;
+        };
         // A tick short enough to notice the deadline, long enough not to spin.
-        let sock = match open_socket(&daemon, &msg, 1000) {
+        let sock = match open_socket(&path, first, 1000) {
             Ok(s) => s,
             Err(e) => return fail(&e),
         };
+        for m in rest {
+            if let Err(e) = send_on(&sock, m) {
+                return fail(&e);
+            }
+        }
         let deadline = Instant::now() + Duration::from_secs(secs);
         let mut lines = BufReader::new(sock).lines();
         while Instant::now() < deadline {
             match lines.next() {
                 Some(Ok(line)) => {
                     let line = line.trim();
-                    if !line.is_empty() {
-                        host.print(&format!("{line}\n"));
+                    if line.is_empty() {
+                        continue;
                     }
+                    let frame = match serde_json::from_str::<Value>(line) {
+                        Ok(v) => unwrap_frame(v),
+                        Err(_) => continue,
+                    };
+                    // Terminal output is bytes that happen to have crossed a JSON
+                    // pipe: printing the base64 would be printing the envelope.
+                    if frame["ev"] == json!("output") {
+                        if let Some(text) = b64_text(&frame) {
+                            host.print(&text);
+                            continue;
+                        }
+                    }
+                    host.print(&format!("{frame}\n"));
                 }
                 // A read timeout ends the iterator; the deadline decides whether
                 // that is "quiet" or "done".
@@ -1811,8 +1872,26 @@ fn stream(host: &Host, mut msg: Value, secs: u64) -> c_int {
     }
     #[cfg(not(unix))]
     {
-        let _ = (host, msg, secs);
+        let _ = (host, msgs, secs);
         fail("streaming is not supported on this platform")
+    }
+}
+
+/// The `b64` field of a frame, decoded, when it is valid UTF-8 — PTY output is
+/// the shell's own bytes and belongs on the terminal as text.
+fn b64_text(frame: &Value) -> Option<String> {
+    use base64::Engine;
+    let b64 = frame.get("b64")?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// A bus frame's payload, or the message itself on the daemon — so a stream
+/// prints the same lines whichever endpoint served it.
+fn unwrap_frame(v: Value) -> Value {
+    match v.get("t").and_then(Value::as_str) {
+        Some("event") | Some("reply") => v.get("value").cloned().unwrap_or(v),
+        _ => v,
     }
 }
 
@@ -2006,11 +2085,23 @@ fn dispatch(host: &Host, sub: &Sub, rest: &[String]) -> c_int {
     if sub.stream {
         let secs = stream_secs(host, &args);
         let mut msg = args;
+        let mut extra = Vec::new();
         if let Some(o) = msg.as_object_mut() {
             o.remove("secs");
             o.insert("cmd".into(), json!(sub.verb));
+            // `pty run CMD` is spawn-then-type on ONE connection, because the
+            // terminal belongs to that connection's session and a second
+            // invocation would find nothing to type into.
+            if let Some(cmd) = o.remove("run").map(|v| match v {
+                Value::String(s) => s,
+                other => other.to_string(),
+            }) {
+                extra.push(json!({ "cmd": "pty_write", "data": format!("{cmd}\n") }));
+            }
         }
-        return stream(host, msg, secs);
+        let mut msgs = vec![msg];
+        msgs.extend(extra);
+        return stream(host, msgs, secs);
     }
     if sub.verb.starts_with("browser.") {
         return call_verb(host, sub.verb, args, true);
@@ -2552,7 +2643,7 @@ fn emit_apps(host: &Host, prefix: &str) {
 
 declare_plugin! {
     name: "zwire",
-    version: "0.2.0",
+    version: "0.3.0",
     builtins: {
         "zwire" => zwire,
     },

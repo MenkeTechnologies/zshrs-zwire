@@ -1,6 +1,6 @@
 [package]
 name = "zwire"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 description = "Native zshrs plugin: the whole zgui automation bus as a shell builtin"
@@ -15,3 +15,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 znative = "0.12"
 serde_json = "1"
+# Same decoder the host encodes with: PTY output and `fs read` cross the JSON
+# pipe as base64, and a shell wants the bytes.
+base64 = "0.22"

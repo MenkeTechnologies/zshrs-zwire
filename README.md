@@ -114,7 +114,7 @@ command's arguments. A group with no command prints its commands.
 | `stryke` | `run lsp send stop` |
 | `suite` | `list verbs call get` |
 | `bus` · `peer` · `watch` | `pub sub unsub` · `list connect remote` · `list stop` |
-| `pty` | `spawn write resize kill` |
+| `pty` | `run spawn write resize kill` |
 | `tmux` | `status tree sessions panes search capture focus send run command sync broadcast options setopt keys setkey unbindkey buffers buffer setbuffer delbuffer paste export import snaps snap save restore rename rmsnap hud` |
 
 Completion is native: `zwire <TAB>` offers commands and groups, `zwire fs <TAB>`
@@ -201,8 +201,18 @@ zwire bus sub scheme secs=120
 
 `secs=` bounds the wait (default 30, or `$ZWIRE_STREAM_SECS`) — a builtin runs in
 the shell's own process, so an unbounded read would hand the terminal to a loop.
-Streaming needs the NDJSON daemon (`zwire-host serve`), because a bus frame is
-answered once and closed.
+
+Streams work over **every** endpoint, including the bus: a bus connection owns a
+real session (zwire-host 0.3.21+), so what it emits unasked arrives as
+`{"t":"event"}` frames and is unwrapped here. PTY output is decoded and printed
+as the bytes it is, not as base64.
+
+A terminal belongs to the connection that spawned it, so typing into one needs a
+single connection — which is what `pty run` is:
+
+```sh
+zwire pty run 'make -j8' secs=120      # spawn, type it, stream the output
+```
 
 ---
 
@@ -234,9 +244,9 @@ Which socket it takes, in order:
    *process-global* topic, so this is the only endpoint from which `zwire tab
    new` actually reaches the browser rather than queueing where nobody listens.
 2. **`zwire-host.sock`** — the NDJSON daemon, when `zwire-host serve` is running.
-   Streams need this one.
 3. **`zwire.sock`** — the command bus (`App::open("zwire")`), always up with the
-   browser but not attached to it: good for state, not for actions.
+   browser but not attached to it: good for state and for the machine, not for
+   browser actions.
 4. **`zwire-host call`** — the bundled client, which is what covers Windows'
    named pipe with no second implementation here.
 
