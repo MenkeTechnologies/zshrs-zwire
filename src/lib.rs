@@ -1,24 +1,30 @@
-//! **zwire** — drive the [zwire](https://github.com/MenkeTechnologies/zwire)
-//! browser from the shell, as a native zshrs plugin.
+//! **zwire** — the whole zgui automation bus as a shell builtin.
 //!
-//! The browser publishes its automation surface through
+//! [zwire](https://github.com/MenkeTechnologies/zwire)'s browser and the machine
+//! under it are published by
 //! [`zwire-host`](https://github.com/MenkeTechnologies/zwire-host): local
 //! endpoints (Unix sockets on macOS/Linux, named pipes on Windows) speaking
-//! newline-delimited JSON. They answer `{"cmd":…}` host commands, forward
-//! `browser.*` automation verbs to the HUD service worker, and project the live
-//! DOM as typed `page.*` state.
+//! newline-delimited JSON. One dispatcher answers `{"cmd":…}` host commands,
+//! forwards `browser.*` automation verbs to the HUD service worker, projects the
+//! live DOM as typed `page.*` state, and — through `suite_*` — dials the OTHER
+//! apps on the bus.
 //!
-//! This plugin speaks that protocol directly — one connect, one line out, one
-//! line back — so `zwire tab new`, `zwire scheme matrix` and `zwire page tables`
-//! are shell builtins running native code, with no `curl`, no remote-debugging
-//! port and no client library.
+//! This plugin puts every one of those on the command line. [`SUBS`] is the
+//! whole named surface: one row per command, each naming the verb it sends and
+//! the arguments it binds positionally, so `zwire fs grep ~/src TODO`,
+//! `zwire tmux send %3 'make'`, `zwire suite call zcite item.add`, `zwire txn
+//! begin` and `zwire page tables` all take the same path. `zwire audit` asks the
+//! running host for its surface and prints anything not reachable by name — the
+//! table cannot silently fall behind the host it drives.
 //!
-//! See `endpoints` for which socket a request takes and why the order matters.
+//! See [`endpoints`] for which socket a request takes and why the order matters.
 //!
 //! Protocol citations (`h:`) refer to zwire-host's sources: `src/lib.rs`
 //! (`default_socket`), `src/session.rs` (`handle_cmd`, `theme_write`),
-//! `src/zbus.rs` (`serve_conn`, `run_command`, `surface`), `src/page.rs`
-//! (`STATES`, `endpoint::bind`) and `src/store.rs` (`SCHEMES`, `write_ui`).
+//! `src/zbus.rs` (`serve_conn`, `run_command`, `surface`, `SURFACE_VERBS`),
+//! `src/page.rs` (`STATES`, `endpoint::bind`), `src/fsx.rs`, `src/tmuxops.rs`,
+//! `src/hooks.rs`, `src/suite.rs` and `src/store.rs`; `background.js` (`execZbAction`)
+//! is the browser half of every `browser.*` verb.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -26,19 +32,1461 @@ use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use znative::{declare_plugin, Args, Host};
 
-/* ------------------------------------------------------------------ tables */
+/* ----------------------------------------------------------------- surface */
 
-/// A subcommand → `browser.*` verb table.
-type Table = &'static [(&'static str, &'static str)];
+/// One named command: `zwire <group> <name>` (or `zwire <name>` when `group` is
+/// empty) sends `verb`, binding `args` from the words that follow.
+///
+/// `args` entries are positional in order, with three markers:
+/// * `name?` — optional, bound only if a word is there.
+/// * `*name` — every remaining word, as an array.
+/// * `**name` — every remaining `k=v`, as a nested object (what `suite call`
+///   needs, since the called app's arguments must not collide with this one's).
+///
+/// Whatever is left over is parsed as top-level `k=v`, so a row never has to
+/// name every optional field the host accepts — `zwire fs walk ~/src ext=rs
+/// depth=3` reaches fields this table does not mention.
+struct Sub {
+    group: &'static str,
+    name: &'static str,
+    verb: &'static str,
+    args: &'static [&'static str],
+    doc: &'static str,
+    /// The reply is a STREAM of frames rather than one answer (`fs_watch`,
+    /// `sysinfo_start`, `sub`, …). Printed until `secs=` elapses.
+    stream: bool,
+}
+
+/// Shorthand for a row.
+const fn s(
+    group: &'static str,
+    name: &'static str,
+    verb: &'static str,
+    args: &'static [&'static str],
+    doc: &'static str,
+) -> Sub {
+    Sub {
+        group,
+        name,
+        verb,
+        args,
+        doc,
+        stream: false,
+    }
+}
+
+/// Shorthand for a streaming row.
+const fn st(
+    group: &'static str,
+    name: &'static str,
+    verb: &'static str,
+    args: &'static [&'static str],
+    doc: &'static str,
+) -> Sub {
+    Sub {
+        group,
+        name,
+        verb,
+        args,
+        doc,
+        stream: true,
+    }
+}
+
+/// The named surface. Every row is one command on the bus.
+const SUBS: &[Sub] = &[
+    /* ---- tabs (browser.*, executed by background.js execZbAction) ---- */
+    s("tab", "new", "browser.newTab", &[], "open an empty tab"),
+    s(
+        "tab",
+        "close",
+        "browser.closeTab",
+        &[],
+        "close the active tab",
+    ),
+    s(
+        "tab",
+        "others",
+        "browser.closeOthers",
+        &[],
+        "close every other tab",
+    ),
+    s(
+        "tab",
+        "right",
+        "browser.closeRight",
+        &[],
+        "close tabs to the right",
+    ),
+    s(
+        "tab",
+        "left",
+        "browser.closeLeft",
+        &[],
+        "close tabs to the left",
+    ),
+    s(
+        "tab",
+        "dups",
+        "browser.closeDuplicates",
+        &[],
+        "close duplicate URLs",
+    ),
+    s(
+        "tab",
+        "reopen",
+        "browser.reopenTab",
+        &[],
+        "restore the last closed tab",
+    ),
+    s(
+        "tab",
+        "dup",
+        "browser.duplicateTab",
+        &[],
+        "duplicate the active tab",
+    ),
+    s("tab", "pin", "browser.pinTab", &[], "toggle pinned"),
+    s("tab", "unpin", "browser.unpinTab", &[], "unpin"),
+    s("tab", "mute", "browser.muteTab", &[], "toggle muted"),
+    s("tab", "unmute", "browser.unmuteTab", &[], "unmute"),
+    s(
+        "tab",
+        "muteothers",
+        "browser.muteOthers",
+        &[],
+        "mute every other tab",
+    ),
+    s(
+        "tab",
+        "discard",
+        "browser.discardTab",
+        &[],
+        "discard (free its memory)",
+    ),
+    s(
+        "tab",
+        "next",
+        "browser.nextTab",
+        &[],
+        "activate the next tab",
+    ),
+    s(
+        "tab",
+        "prev",
+        "browser.prevTab",
+        &[],
+        "activate the previous tab",
+    ),
+    s(
+        "tab",
+        "first",
+        "browser.firstTab",
+        &[],
+        "activate the first tab",
+    ),
+    s(
+        "tab",
+        "last",
+        "browser.lastTab",
+        &[],
+        "activate the last tab",
+    ),
+    s(
+        "tab",
+        "goto",
+        "browser.gotoTab",
+        &["index"],
+        "activate tab N (0-based)",
+    ),
+    s(
+        "tab",
+        "activate",
+        "browser.activate",
+        &["tabId"],
+        "activate a tab by id",
+    ),
+    s(
+        "tab",
+        "moveleft",
+        "browser.moveTabLeft",
+        &[],
+        "move one place left",
+    ),
+    s(
+        "tab",
+        "moveright",
+        "browser.moveTabRight",
+        &[],
+        "move one place right",
+    ),
+    s(
+        "tab",
+        "movefirst",
+        "browser.moveTabFirst",
+        &[],
+        "move to the front",
+    ),
+    s(
+        "tab",
+        "movelast",
+        "browser.moveTabLast",
+        &[],
+        "move to the end",
+    ),
+    s(
+        "tab",
+        "detach",
+        "browser.tabToNewWindow",
+        &[],
+        "move it to a new window",
+    ),
+    s(
+        "tab",
+        "sort",
+        "browser.sortTabs",
+        &[],
+        "sort the strip by URL",
+    ),
+    s("tab", "muteall", "browser.muteAll", &[], "mute every tab"),
+    s(
+        "tab",
+        "unmuteall",
+        "browser.unmuteAll",
+        &[],
+        "unmute every tab",
+    ),
+    s("tab", "pinall", "browser.pinAll", &[], "pin every tab"),
+    s(
+        "tab",
+        "unpinall",
+        "browser.unpinAll",
+        &[],
+        "unpin every tab",
+    ),
+    s(
+        "tab",
+        "group",
+        "browser.groupTabs",
+        &[],
+        "group the window's tabs",
+    ),
+    s("tab", "ungroup", "browser.ungroupTabs", &[], "ungroup them"),
+    s(
+        "tab",
+        "collapse",
+        "browser.collapseGroups",
+        &[],
+        "collapse tab groups",
+    ),
+    s(
+        "tab",
+        "expand",
+        "browser.expandGroups",
+        &[],
+        "expand tab groups",
+    ),
+    /* ---- windows ---- */
+    s("win", "new", "browser.newWindow", &[], "new window"),
+    s(
+        "win",
+        "incognito",
+        "browser.incognitoWindow",
+        &[],
+        "new incognito window",
+    ),
+    s(
+        "win",
+        "close",
+        "browser.closeWindow",
+        &[],
+        "close the focused window",
+    ),
+    s("win", "min", "browser.minimizeWindow", &[], "minimize"),
+    s("win", "max", "browser.maximizeWindow", &[], "maximize"),
+    s("win", "full", "browser.fullscreenWindow", &[], "fullscreen"),
+    s(
+        "win",
+        "restore",
+        "browser.restoreWindow",
+        &[],
+        "back to normal state",
+    ),
+    s(
+        "win",
+        "next",
+        "browser.nextWindow",
+        &[],
+        "focus the next window",
+    ),
+    s(
+        "win",
+        "prev",
+        "browser.prevWindow",
+        &[],
+        "focus the previous window",
+    ),
+    s(
+        "win",
+        "merge",
+        "browser.mergeWindows",
+        &[],
+        "merge every window into one",
+    ),
+    s(
+        "win",
+        "center",
+        "browser.centerWindow",
+        &[],
+        "center on its display",
+    ),
+    s(
+        "win",
+        "display",
+        "browser.moveWindowNextDisplay",
+        &[],
+        "move to the next display",
+    ),
+    /* ---- tiling ---- */
+    s(
+        "snap",
+        "left",
+        "browser.snapLeft",
+        &[],
+        "snap to the left half",
+    ),
+    s(
+        "snap",
+        "right",
+        "browser.snapRight",
+        &[],
+        "snap to the right half",
+    ),
+    s(
+        "snap",
+        "top",
+        "browser.snapTop",
+        &[],
+        "snap to the top half",
+    ),
+    s(
+        "snap",
+        "bottom",
+        "browser.snapBottom",
+        &[],
+        "snap to the bottom half",
+    ),
+    s(
+        "snap",
+        "topleft",
+        "browser.snapTopLeft",
+        &[],
+        "snap to the top-left quarter",
+    ),
+    s(
+        "snap",
+        "topright",
+        "browser.snapTopRight",
+        &[],
+        "snap to the top-right quarter",
+    ),
+    s(
+        "snap",
+        "bottomleft",
+        "browser.snapBottomLeft",
+        &[],
+        "snap to the bottom-left quarter",
+    ),
+    s(
+        "snap",
+        "bottomright",
+        "browser.snapBottomRight",
+        &[],
+        "snap to the bottom-right quarter",
+    ),
+    /* ---- navigation + zoom ---- */
+    s("nav", "back", "browser.goBack", &[], "go back"),
+    s("nav", "forward", "browser.goForward", &[], "go forward"),
+    s("nav", "reload", "browser.reload", &[], "reload"),
+    s(
+        "nav",
+        "hard",
+        "browser.reloadHard",
+        &[],
+        "reload, bypassing the cache",
+    ),
+    s(
+        "nav",
+        "reloadall",
+        "browser.reloadAll",
+        &[],
+        "reload every tab in the window",
+    ),
+    s("nav", "home", "browser.home", &[], "go to the new-tab page"),
+    s("zoom", "in", "browser.zoomIn", &[], "zoom in"),
+    s("zoom", "out", "browser.zoomOut", &[], "zoom out"),
+    s("zoom", "reset", "browser.zoomReset", &[], "reset zoom"),
+    /* ---- browsing data ---- */
+    s(
+        "clear",
+        "cache",
+        "browser.clearCache",
+        &[],
+        "clear the cache",
+    ),
+    s(
+        "clear",
+        "cookies",
+        "browser.clearCookies",
+        &[],
+        "clear cookies",
+    ),
+    s(
+        "clear",
+        "both",
+        "browser.clearCacheAndCookies",
+        &[],
+        "clear cache + cookies",
+    ),
+    s(
+        "clear",
+        "all",
+        "browser.clearAllData",
+        &[],
+        "clear everything",
+    ),
+    s(
+        "clear",
+        "passwords",
+        "browser.clearPasswords",
+        &[],
+        "clear saved passwords",
+    ),
+    /* ---- downloads ---- */
+    s("dl", "get", "browser.download", &["url"], "download a URL"),
+    s(
+        "dl",
+        "pause",
+        "browser.pauseDownload",
+        &[],
+        "pause downloads in progress",
+    ),
+    s(
+        "dl",
+        "resume",
+        "browser.resumeDownload",
+        &[],
+        "resume paused downloads",
+    ),
+    s(
+        "dl",
+        "cancel",
+        "browser.cancelDownload",
+        &[],
+        "cancel downloads",
+    ),
+    s(
+        "dl",
+        "open",
+        "browser.openDownload",
+        &[],
+        "open the last download",
+    ),
+    s(
+        "dl",
+        "show",
+        "browser.showDownload",
+        &[],
+        "reveal it in the file manager",
+    ),
+    s(
+        "dl",
+        "retry",
+        "browser.retryDownload",
+        &[],
+        "retry interrupted downloads",
+    ),
+    s(
+        "dl",
+        "clear",
+        "browser.clearDownloads",
+        &[],
+        "clear the download list",
+    ),
+    s(
+        "dl",
+        "list",
+        "browser.showDownloads",
+        &[],
+        "open the downloads page",
+    ),
+    /* ---- bookmarks / reading list / history ---- */
+    s(
+        "bm",
+        "add",
+        "browser.bookmarkTab",
+        &[],
+        "bookmark the active tab",
+    ),
+    s(
+        "bm",
+        "folder",
+        "browser.bookmarkFolder",
+        &["title?"],
+        "create a bookmark folder",
+    ),
+    s(
+        "bm",
+        "remove",
+        "browser.removeBookmark",
+        &[],
+        "unbookmark the active tab",
+    ),
+    s(
+        "read",
+        "add",
+        "browser.addReadingList",
+        &[],
+        "add the tab to the reading list",
+    ),
+    s(
+        "read",
+        "remove",
+        "browser.removeReadingList",
+        &[],
+        "remove it",
+    ),
+    s(
+        "hist",
+        "clear",
+        "browser.clearHistory",
+        &[],
+        "delete all history",
+    ),
+    s(
+        "hist",
+        "del",
+        "browser.deleteHistoryUrl",
+        &["url"],
+        "delete one URL",
+    ),
+    s(
+        "hist",
+        "add",
+        "browser.addHistoryUrl",
+        &["url"],
+        "add a URL to history",
+    ),
+    /* ---- extensions / apps / power ---- */
+    s(
+        "ext",
+        "enable",
+        "browser.enableExtension",
+        &["id"],
+        "enable an extension",
+    ),
+    s(
+        "ext",
+        "disable",
+        "browser.disableExtension",
+        &["id"],
+        "disable it",
+    ),
+    s(
+        "ext",
+        "uninstall",
+        "browser.uninstallExtension",
+        &["id"],
+        "uninstall it",
+    ),
+    s(
+        "ext",
+        "options",
+        "browser.extensionOptions",
+        &["id"],
+        "open its options page",
+    ),
+    s(
+        "ext",
+        "launch",
+        "browser.launchApp",
+        &["id"],
+        "launch a packaged app",
+    ),
+    s(
+        "power",
+        "awake",
+        "browser.keepAwake",
+        &[],
+        "keep the system awake",
+    ),
+    s(
+        "power",
+        "display",
+        "browser.keepDisplayAwake",
+        &[],
+        "keep the display awake",
+    ),
+    s(
+        "power",
+        "sleep",
+        "browser.allowSleep",
+        &[],
+        "release the wake lock",
+    ),
+    /* ---- the live page (page.rs — reads only, never writes) ---- */
+    s(
+        "page",
+        "url",
+        "page.url",
+        &[],
+        "address of the rendered page",
+    ),
+    s("page", "title", "page.title", &[], "document title"),
+    s("page", "text", "page.text", &[], "rendered body text"),
+    s(
+        "page",
+        "links",
+        "page.links",
+        &[],
+        "every link: text + resolved href",
+    ),
+    s("page", "headings", "page.headings", &[], "heading outline"),
+    s(
+        "page",
+        "tables",
+        "page.tables",
+        &[],
+        "every table as rows of cells",
+    ),
+    s(
+        "page",
+        "forms",
+        "page.forms",
+        &[],
+        "form shape — never field values",
+    ),
+    s(
+        "page",
+        "meta",
+        "page.meta",
+        &[],
+        "description, canonical, og:*, JSON-LD",
+    ),
+    s(
+        "page",
+        "selection",
+        "page.selection",
+        &[],
+        "the current selection",
+    ),
+    s(
+        "page",
+        "extract",
+        "page.extract",
+        &["selector", "attr?"],
+        "any selector, optionally one attribute",
+    ),
+    s(
+        "page",
+        "assert",
+        "page.assert",
+        &["state?", "op?", "value?"],
+        "test a projection (contains, equals, count_at_least, …)",
+    ),
+    s(
+        "page",
+        "witness",
+        "page.witness",
+        &["state?", "op?", "value?"],
+        "declare a projection as a premise of the open transaction",
+    ),
+    s(
+        "page",
+        "batch",
+        "page.batch",
+        &[],
+        "several reads in one round trip: reads=[…]",
+    ),
+    s(
+        "page",
+        "states",
+        "page_states",
+        &[],
+        "the catalogue, and whether a browser is attached",
+    ),
+    /* ---- transactions (a chain that unwinds itself) ---- */
+    s("txn", "begin", "txn_begin", &["txn?"], "open a transaction"),
+    s(
+        "txn",
+        "commit",
+        "txn_commit",
+        &["txn"],
+        "commit it — premises re-checked first",
+    ),
+    s(
+        "txn",
+        "abort",
+        "txn_abort",
+        &["txn"],
+        "compensate every journaled step, in reverse",
+    ),
+    s(
+        "txn",
+        "undo",
+        "browser.undo",
+        &["txn"],
+        "replay one transaction's inverses in the browser",
+    ),
+    /* ---- filesystem (fsops.rs + fsx.rs) ---- */
+    s(
+        "fs",
+        "read",
+        "fs_read",
+        &["path"],
+        "read a file → {b64, text}",
+    ),
+    s("fs", "write", "fs_write", &["path", "text"], "write a file"),
+    s(
+        "fs",
+        "append",
+        "fs_append",
+        &["path", "text"],
+        "append to a file",
+    ),
+    s(
+        "fs",
+        "list",
+        "fs_list",
+        &["path"],
+        "one level: {name, dir, size}",
+    ),
+    s(
+        "fs",
+        "walk",
+        "fs_walk",
+        &["path"],
+        "recursive crawl (ext=, depth=, contains=, dirs_only=)",
+    ),
+    s("fs", "stat", "fs_stat", &["path"], "stat one path"),
+    s("fs", "mkdir", "fs_mkdir", &["path"], "mkdir -p"),
+    s(
+        "fs",
+        "rm",
+        "fs_rm",
+        &["path"],
+        "remove (recursive=true for a tree)",
+    ),
+    s(
+        "fs",
+        "ls",
+        "fs_list_dir",
+        &["dir_path"],
+        "browser listing, directories first",
+    ),
+    s(
+        "fs",
+        "subdirs",
+        "fs_list_subdirs",
+        &["dir_path"],
+        "directories only",
+    ),
+    s(
+        "fs",
+        "info",
+        "fs_get_info",
+        &["path"],
+        "kind, sizes, times, mode, owner, link target",
+    ),
+    s(
+        "fs",
+        "size",
+        "fs_folder_size",
+        &["folder_path"],
+        "recursive {bytes, files}",
+    ),
+    s(
+        "fs",
+        "disk",
+        "fs_disk_usage",
+        &["path"],
+        "the mount holding a path",
+    ),
+    s(
+        "fs",
+        "xattrs",
+        "fs_xattrs",
+        &["path"],
+        "extended attributes",
+    ),
+    s(
+        "fs",
+        "git",
+        "fs_git_status",
+        &["dir_path"],
+        "porcelain status codes",
+    ),
+    s("fs", "hash", "fs_hash", &["path"], "streamed SHA-256"),
+    s(
+        "fs",
+        "grep",
+        "fs_grep",
+        &["root", "needle"],
+        "search a tree (case_insensitive=, max_results=)",
+    ),
+    s(
+        "fs",
+        "dups",
+        "fs_find_duplicates",
+        &["dir"],
+        "duplicate files by content",
+    ),
+    s(
+        "fs",
+        "compare",
+        "fs_compare_dirs",
+        &["dir_a", "dir_b"],
+        "onlyInA / onlyInB / different",
+    ),
+    s(
+        "fs",
+        "diff",
+        "fs_diff",
+        &["path_a", "path_b"],
+        "unified text diff",
+    ),
+    s(
+        "fs",
+        "zip",
+        "fs_compress",
+        &["archive_path"],
+        "write a zip: paths=[…]",
+    ),
+    s(
+        "fs",
+        "unzip",
+        "fs_extract",
+        &["archive_path", "dest_dir"],
+        "extract zip/tar/tgz",
+    ),
+    s(
+        "fs",
+        "b64",
+        "fs_read_file_base64",
+        &["file_path"],
+        "whole file as base64",
+    ),
+    s(
+        "fs",
+        "head",
+        "fs_read_head",
+        &["file_path"],
+        "head as text (max_bytes=)",
+    ),
+    s(
+        "fs",
+        "headbytes",
+        "fs_read_head_bytes",
+        &["file_path"],
+        "head as raw bytes",
+    ),
+    s(
+        "fs",
+        "newdir",
+        "fs_create_dir",
+        &["dir_path"],
+        "create a directory (refuses an existing one)",
+    ),
+    s(
+        "fs",
+        "newfile",
+        "fs_create_file",
+        &["file_path"],
+        "create a file",
+    ),
+    s(
+        "fs",
+        "copy",
+        "fs_copy_path",
+        &["src", "dest"],
+        "copy a file or tree",
+    ),
+    s(
+        "fs",
+        "dup",
+        "fs_duplicate",
+        &["path"],
+        "make the next free ` copy` sibling",
+    ),
+    s(
+        "fs",
+        "rename",
+        "fs_rename_file",
+        &["old_path", "new_path"],
+        "rename / move",
+    ),
+    s(
+        "fs",
+        "del",
+        "fs_delete_file",
+        &["file_path"],
+        "delete a file or tree",
+    ),
+    s(
+        "fs",
+        "trash",
+        "fs_move_to_trash",
+        &["file_path"],
+        "recoverable delete",
+    ),
+    s(
+        "fs",
+        "shred",
+        "fs_secure_delete",
+        &["file_path"],
+        "zero the bytes, then unlink",
+    ),
+    s(
+        "fs",
+        "touch",
+        "fs_touch",
+        &["file_path"],
+        "create / bump atime + mtime",
+    ),
+    s(
+        "fs",
+        "chmod",
+        "fs_chmod",
+        &["path", "mode_octal"],
+        "set permission bits",
+    ),
+    s(
+        "fs",
+        "relink",
+        "fs_symlink_retarget",
+        &["path", "new_target"],
+        "repoint a symlink",
+    ),
+    s("fs", "home", "fs_home_dir", &[], "what `~` expands to"),
+    st(
+        "fs",
+        "watch",
+        "fs_watch",
+        &["path"],
+        "stream created/modified/removed",
+    ),
+    st(
+        "fs",
+        "tail",
+        "fs_tail",
+        &["path"],
+        "stream appended lines (survives rotation)",
+    ),
+    /* ---- exec, jobs, processes ---- */
+    s(
+        "",
+        "exec",
+        "exec",
+        &["program", "*args"],
+        "run to completion → {code, stdout, stderr}",
+    ),
+    s("", "ps", "ps", &["filter?"], "processes by memory"),
+    s(
+        "",
+        "kill",
+        "kill",
+        &["pid", "signal?"],
+        "signal a process (term default)",
+    ),
+    s(
+        "",
+        "which",
+        "which",
+        &["program"],
+        "resolve a program on $PATH",
+    ),
+    s(
+        "job",
+        "start",
+        "job_start",
+        &["program", "*args"],
+        "background job; notifies on completion",
+    ),
+    s("job", "list", "job_list", &[], "status of every job"),
+    s(
+        "job",
+        "result",
+        "job_result",
+        &["id"],
+        "fetch + remove one finished job",
+    ),
+    s("job", "poll", "job_poll", &[], "drain every finished job"),
+    /* ---- machine + host state ---- */
+    s(
+        "host",
+        "info",
+        "hostinfo",
+        &[],
+        "os, arch, kernel, hostname, cpus, mem, LAN ip",
+    ),
+    s(
+        "host",
+        "hello",
+        "hello",
+        &[],
+        "handshake: version + capability tags",
+    ),
+    s(
+        "host",
+        "log",
+        "hostlog",
+        &[],
+        "recent host commands (limit=)",
+    ),
+    s(
+        "host",
+        "theme",
+        "get",
+        &[],
+        "the shared theme: scheme, ui, palette, schemes",
+    ),
+    s(
+        "host",
+        "open",
+        "open",
+        &["target"],
+        "open a path/URL with the OS default handler",
+    ),
+    s(
+        "host",
+        "notify",
+        "notify",
+        &["title", "body?"],
+        "notification from the HOST (top-level `notify` is the browser's)",
+    ),
+    s(
+        "host",
+        "ping",
+        "ping",
+        &[],
+        "liveness check — the same reply as hello",
+    ),
+    s("sys", "once", "sysinfo_once", &[], "one system snapshot"),
+    st(
+        "sys",
+        "stream",
+        "sysinfo_start",
+        &[],
+        "stream stats (interval_ms=)",
+    ),
+    s("sys", "stop", "sysinfo_stop", &[], "stop the stream"),
+    st(
+        "sys",
+        "meter",
+        "meter_stream",
+        &["path"],
+        "stream an audio meter file",
+    ),
+    /* ---- key/value store ---- */
+    s(
+        "kv",
+        "get",
+        "kv_get",
+        &["key"],
+        "read (app= namespace, default zwire)",
+    ),
+    s("kv", "set", "kv_set", &["key", "value"], "write"),
+    s(
+        "kv",
+        "merge",
+        "kv_merge",
+        &["key", "value"],
+        "shallow-merge",
+    ),
+    s("kv", "del", "kv_del", &["key"], "delete"),
+    s("kv", "keys", "kv_keys", &[], "list keys"),
+    /* ---- lifecycle hooks (stryke scripts bound to browser events) ---- */
+    s("hooks", "list", "hooks_list", &[], "every hook"),
+    s(
+        "hooks",
+        "events",
+        "hooks_events",
+        &[],
+        "the bindable events",
+    ),
+    s(
+        "hooks",
+        "save",
+        "hooks_save",
+        &[],
+        "create / update: hook={…}",
+    ),
+    s("hooks", "delete", "hooks_delete", &["id"], "delete one"),
+    s(
+        "hooks",
+        "enable",
+        "hooks_set_enabled",
+        &["id", "enabled"],
+        "enable / disable one",
+    ),
+    s(
+        "hooks",
+        "script",
+        "hooks_get_script",
+        &["id"],
+        "read its script",
+    ),
+    s(
+        "hooks",
+        "path",
+        "hooks_script_path",
+        &["id"],
+        "where that script lives",
+    ),
+    s(
+        "hooks",
+        "setscript",
+        "hooks_set_script",
+        &["id", "code"],
+        "replace its script",
+    ),
+    s(
+        "hooks",
+        "test",
+        "hooks_test_run",
+        &["id"],
+        "run it against a sample (sample=)",
+    ),
+    s(
+        "hooks",
+        "fire",
+        "hook_fire",
+        &["event"],
+        "fire an event (payload=)",
+    ),
+    /* ---- stryke ---- */
+    s(
+        "stryke",
+        "run",
+        "stryke_run",
+        &["code"],
+        "run stryke code (stdin=)",
+    ),
+    s(
+        "stryke",
+        "lsp",
+        "stryke_lsp_start",
+        &[],
+        "start the language server",
+    ),
+    s(
+        "stryke",
+        "send",
+        "stryke_lsp_send",
+        &[],
+        "send it one LSP message",
+    ),
+    s("stryke", "stop", "stryke_lsp_stop", &[], "stop it"),
+    /* ---- the OTHER apps on the bus (suite.rs — the client leg) ---- */
+    s(
+        "suite",
+        "list",
+        "suite_list",
+        &[],
+        "which suite apps are actually running",
+    ),
+    s(
+        "suite",
+        "verbs",
+        "suite_verbs",
+        &["app"],
+        "that app's typed surface",
+    ),
+    s(
+        "suite",
+        "call",
+        "suite_call",
+        &["app", "verb", "**args"],
+        "invoke one of its verbs",
+    ),
+    s(
+        "suite",
+        "get",
+        "suite_get",
+        &["app", "state"],
+        "read one of its state queries",
+    ),
+    /* ---- pub/sub + peers ---- */
+    s(
+        "bus",
+        "pub",
+        "pub",
+        &["topic", "data"],
+        "fan a message out to every subscriber",
+    ),
+    st(
+        "bus",
+        "sub",
+        "sub",
+        &["topic"],
+        "stream a topic (secs= bounds the wait)",
+    ),
+    s("bus", "unsub", "unsub", &["topic"], "stop receiving it"),
+    s("peer", "list", "peers", &[], "linked hosts"),
+    s(
+        "peer",
+        "connect",
+        "peer_connect",
+        &["addr"],
+        "dial another host",
+    ),
+    s(
+        "peer",
+        "remote",
+        "remote",
+        &["peer"],
+        "run one request on a peer: request={…}",
+    ),
+    /* ---- observers ---- */
+    s("watch", "list", "watch_list", &[], "active observers"),
+    s("watch", "stop", "watch_stop", &["id?"], "stop one"),
+    /* ---- PTY ---- */
+    st(
+        "pty",
+        "spawn",
+        "pty_spawn",
+        &[],
+        "start a terminal (shell=, cols=, rows=, id=)",
+    ),
+    s("pty", "write", "pty_write", &["data"], "type into it (id=)"),
+    s(
+        "pty",
+        "resize",
+        "pty_resize",
+        &["cols", "rows"],
+        "resize it",
+    ),
+    s("pty", "kill", "pty_kill", &[], "kill it"),
+    /* ---- the REAL tmux server (tmuxops.rs, over tmux's own wire protocol) ---- */
+    s(
+        "tmux",
+        "status",
+        "tmux_status",
+        &[],
+        "is a server running, and what would start one",
+    ),
+    s(
+        "tmux",
+        "tree",
+        "tmux_tree",
+        &[],
+        "sessions → windows → panes",
+    ),
+    s("tmux", "sessions", "tmux_sessions", &[], "session summary"),
+    s("tmux", "panes", "tmux_panes", &[], "every pane"),
+    s(
+        "tmux",
+        "search",
+        "tmux_search",
+        &[],
+        "the searchable pane corpus",
+    ),
+    s(
+        "tmux",
+        "capture",
+        "tmux_capture",
+        &["pane"],
+        "a pane's visible text",
+    ),
+    s(
+        "tmux",
+        "focus",
+        "tmux_focus",
+        &["session", "window?", "pane?"],
+        "focus a session/window/pane",
+    ),
+    s(
+        "tmux",
+        "send",
+        "tmux_send",
+        &["text", "*panes"],
+        "send keys to panes (enter=false to hold)",
+    ),
+    s(
+        "tmux",
+        "run",
+        "tmux_run",
+        &["*args"],
+        "fire-and-forget tmux command line",
+    ),
+    s(
+        "tmux",
+        "command",
+        "tmux_command",
+        &["*args"],
+        "run one and wait: {code, stdout, stderr}",
+    ),
+    s(
+        "tmux",
+        "sync",
+        "tmux_sync",
+        &["window", "on?"],
+        "synchronize-panes on a window",
+    ),
+    s(
+        "tmux",
+        "broadcast",
+        "tmux_broadcast_list",
+        &[],
+        "windows with sync on",
+    ),
+    s(
+        "tmux",
+        "options",
+        "tmux_options",
+        &[],
+        "server/session options",
+    ),
+    s(
+        "tmux",
+        "setopt",
+        "tmux_set_option",
+        &["scope", "name", "value"],
+        "set one option",
+    ),
+    s("tmux", "keys", "tmux_keys", &[], "the key tables"),
+    s(
+        "tmux",
+        "setkey",
+        "tmux_set_key",
+        &["table", "key", "command"],
+        "bind a key",
+    ),
+    s(
+        "tmux",
+        "unbindkey",
+        "tmux_unbind_key",
+        &["table", "key"],
+        "unbind a key",
+    ),
+    s("tmux", "buffers", "tmux_buffers", &[], "paste buffers"),
+    s(
+        "tmux",
+        "buffer",
+        "tmux_buffer",
+        &["name"],
+        "one buffer's contents",
+    ),
+    s(
+        "tmux",
+        "setbuffer",
+        "tmux_set_buffer",
+        &["name", "content"],
+        "write a buffer",
+    ),
+    s(
+        "tmux",
+        "delbuffer",
+        "tmux_delete_buffer",
+        &["name"],
+        "delete a buffer",
+    ),
+    s(
+        "tmux",
+        "paste",
+        "tmux_paste_buffer",
+        &["name", "pane"],
+        "paste a buffer into a pane",
+    ),
+    s(
+        "tmux",
+        "export",
+        "tmux_export_state",
+        &[],
+        "the whole server state",
+    ),
+    s(
+        "tmux",
+        "import",
+        "tmux_import_state",
+        &[],
+        "restore it: state={…}",
+    ),
+    s("tmux", "snaps", "tmux_snap_list", &[], "saved sessions"),
+    s(
+        "tmux",
+        "snap",
+        "tmux_snap_detail",
+        &["name"],
+        "one saved session",
+    ),
+    s(
+        "tmux",
+        "save",
+        "tmux_snap_save",
+        &["name"],
+        "save one (contents=true keeps pane text)",
+    ),
+    s(
+        "tmux",
+        "restore",
+        "tmux_snap_restore",
+        &["name"],
+        "restore one (relaunch=true reruns programs)",
+    ),
+    s(
+        "tmux",
+        "rename",
+        "tmux_snap_rename",
+        &["name", "new_name"],
+        "rename one",
+    ),
+    s(
+        "tmux",
+        "rmsnap",
+        "tmux_snap_delete",
+        &["name"],
+        "delete one",
+    ),
+    s(
+        "tmux",
+        "hud",
+        "browser.tmux",
+        &["sub"],
+        "the browser's tmux overlay: navigate / split / zoom",
+    ),
+    /* ---- odds and ends that earn a top-level name ---- */
+    s(
+        "",
+        "screenshot",
+        "browser.screenshot",
+        &[],
+        "capture the visible tab",
+    ),
+    s(
+        "",
+        "notify",
+        "browser.notify",
+        &["title", "message?"],
+        "desktop notification from the browser",
+    ),
+    s(
+        "",
+        "lang",
+        "browser.detectLanguage",
+        &[],
+        "the active tab's detected language",
+    ),
+];
 
 /// The built-in colour schemes. h: `store::SCHEMES`. `custom` / `custom-N` are
 /// also accepted by the host (a custom scheme carries its colours in the shared
-/// palette), so they complete too.
+/// palette).
 const SCHEMES: &[&str] = &[
     "cyberpunk",
     "midnight",
@@ -50,112 +1498,25 @@ const SCHEMES: &[&str] = &[
     "vapor",
 ];
 
-/// `zwire tab <sub>` → the `browser.*` verb it runs.
-const TAB_VERBS: &[(&str, &str)] = &[
-    ("new", "newTab"),
-    ("close", "closeTab"),
-    ("others", "closeOthers"),
-    ("right", "closeRight"),
-    ("left", "closeLeft"),
-    ("dups", "closeDuplicates"),
-    ("reopen", "reopenTab"),
-    ("dup", "duplicateTab"),
-    ("pin", "pinTab"),
-    ("unpin", "unpinTab"),
-    ("mute", "muteTab"),
-    ("unmute", "unmuteTab"),
-    ("muteothers", "muteOthers"),
-    ("discard", "discardTab"),
-    ("next", "nextTab"),
-    ("prev", "prevTab"),
-    ("first", "firstTab"),
-    ("last", "lastTab"),
-    ("moveleft", "moveTabLeft"),
-    ("moveright", "moveTabRight"),
-    ("movefirst", "moveTabFirst"),
-    ("movelast", "moveTabLast"),
-    ("detach", "tabToNewWindow"),
-    ("sort", "sortTabs"),
-    ("muteall", "muteAll"),
-    ("unmuteall", "unmuteAll"),
-    ("pinall", "pinAll"),
-    ("unpinall", "unpinAll"),
-    ("group", "groupTabs"),
-    ("ungroup", "ungroupTabs"),
-    ("collapse", "collapseGroups"),
-    ("expand", "expandGroups"),
+/// The predicates `page assert` / `page witness` accept. h: `page::ASSERT_OPS`.
+const ASSERT_OPS: &[&str] = &[
+    "contains",
+    "not_contains",
+    "equals",
+    "empty",
+    "nonempty",
+    "count_at_least",
+    "count_at_most",
 ];
 
-/// `zwire win <sub>` → the `browser.*` verb it runs.
-const WIN_VERBS: &[(&str, &str)] = &[
-    ("new", "newWindow"),
-    ("incognito", "incognitoWindow"),
-    ("close", "closeWindow"),
-    ("min", "minimizeWindow"),
-    ("max", "maximizeWindow"),
-    ("full", "fullscreenWindow"),
-    ("restore", "restoreWindow"),
-    ("next", "nextWindow"),
-    ("prev", "prevWindow"),
-    ("merge", "mergeWindows"),
-    ("center", "centerWindow"),
-    ("display", "moveWindowNextDisplay"),
-];
-
-/// `zwire snap <dir>` → the `browser.snap*` verb it runs.
-const SNAP_VERBS: &[(&str, &str)] = &[
-    ("left", "snapLeft"),
-    ("right", "snapRight"),
-    ("top", "snapTop"),
-    ("bottom", "snapBottom"),
-    ("topleft", "snapTopLeft"),
-    ("topright", "snapTopRight"),
-    ("bottomleft", "snapBottomLeft"),
-    ("bottomright", "snapBottomRight"),
-];
-
-/// `zwire nav <sub>` → the `browser.*` verb it runs. The four common ones are
-/// also top-level subcommands (`zwire back`, `zwire reload`, …).
-const NAV_VERBS: &[(&str, &str)] = &[
-    ("back", "goBack"),
-    ("forward", "goForward"),
-    ("reload", "reload"),
-    ("hard", "reloadHard"),
-    ("reloadall", "reloadAll"),
-    ("home", "home"),
-];
-
-/// `zwire zoom <sub>` → the `browser.zoom*` verb it runs.
-const ZOOM_VERBS: &[(&str, &str)] = &[("in", "zoomIn"), ("out", "zoomOut"), ("reset", "zoomReset")];
-
-/// `zwire clear <what>` → the `browser.clear*` verb it runs.
-const CLEAR_VERBS: &[(&str, &str)] = &[
-    ("cache", "clearCache"),
-    ("cookies", "clearCookies"),
-    ("both", "clearCacheAndCookies"),
-    ("all", "clearAllData"),
-    ("passwords", "clearPasswords"),
-    ("history", "clearHistory"),
-    ("downloads", "clearDownloads"),
-];
-
-/// The live-page projections, without their `page.` prefix. h: `page::STATES`
-/// plus the `page.extract` escape hatch.
-const PAGE_STATES: &[&str] = &[
-    "url",
-    "title",
-    "text",
-    "links",
-    "headings",
-    "tables",
-    "forms",
-    "meta",
-    "selection",
-];
-
-/// Top-level subcommands, for `--help` and for completion.
-const SUBCOMMANDS: &[(&str, &str)] = &[
-    ("status", "host + browser state (default with no arguments)"),
+/// Commands handled in code rather than by a [`SUBS`] row, because each does
+/// something the generic path cannot: several requests, a different reply shape,
+/// or a loop over its arguments.
+const SPECIAL: &[(&str, &str)] = &[
+    (
+        "status",
+        "host + browser state (the default with no arguments)",
+    ),
     ("scheme", "print or set the colour scheme"),
     ("schemes", "list the colour schemes"),
     ("light", "switch the HUD to its light variant"),
@@ -163,39 +1524,36 @@ const SUBCOMMANDS: &[(&str, &str)] = &[
     ("toggle", "flip light/dark"),
     ("open", "open URLs in new tabs"),
     ("goto", "navigate the active tab to a URL"),
-    ("tab", "tab operations"),
-    ("win", "window operations"),
-    ("snap", "snap the window to an edge/corner"),
-    ("nav", "navigation (back/forward/reload/home)"),
-    ("zoom", "zoom the active tab"),
     ("back", "go back"),
     ("forward", "go forward"),
-    ("reload", "reload the active tab"),
-    ("clear", "clear browsing data"),
-    ("bookmark", "bookmark the active tab"),
-    ("download", "download a URL"),
-    ("screenshot", "capture the visible tab"),
-    ("notify", "raise a desktop notification"),
+    (
+        "reload",
+        "reload the active tab (`reload hard` bypasses the cache)",
+    ),
     ("clip", "read or write the clipboard"),
-    ("page", "read the live page as typed state"),
-    ("verbs", "list the automation surface"),
+    (
+        "verbs",
+        "the automation surface, with each verb's reversibility class",
+    ),
     ("call", "call any verb: zwire call VERB k=v …"),
     ("raw", "send one raw host command (JSON)"),
-    ("help", "this text"),
+    ("audit", "surface verbs this plugin does not name"),
+    ("help", "this text, or one group's commands"),
 ];
 
 /* --------------------------------------------------------------- transport */
 
-/// Where zwire-host listens. h: `zwire_host::default_socket` — `$ZWIRE_HOST_SOCK`
-/// wins everywhere; otherwise a *runtime* dir, never the persistent state dir.
+/// Where zwire-host's NDJSON daemon listens. h: `zwire_host::default_socket` —
+/// `$ZWIRE_HOST_SOCK` wins everywhere; otherwise a *runtime* dir, never the
+/// persistent state dir.
 fn socket_path(host: &Host) -> PathBuf {
-    if let Some(p) = cfg(host, "ZWIRE_HOST_SOCK").filter(|s| !s.is_empty()) {
+    if let Some(p) = cfg(host, "ZWIRE_HOST_SOCK") {
         return PathBuf::from(p);
     }
-    if let Some(rt) = cfg(host, "XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
+    if let Some(rt) = cfg(host, "XDG_RUNTIME_DIR") {
         return PathBuf::from(rt).join("zwire-host.sock");
     }
-    if let Some(tmp) = cfg(host, "TMPDIR").filter(|s| !s.is_empty()) {
+    if let Some(tmp) = cfg(host, "TMPDIR") {
         return PathBuf::from(tmp).join("zwire-host.sock");
     }
     let user = cfg(host, "USER").unwrap_or_else(|| "user".into());
@@ -224,6 +1582,20 @@ fn timeout_ms(host: &Host) -> u64 {
         .and_then(|s| s.parse().ok())
         .filter(|&n: &u64| n > 0)
         .unwrap_or(8000)
+}
+
+/// How long a streaming command prints frames before returning. `secs=` on the
+/// command line wins, then `$ZWIRE_STREAM_SECS`, then 30.
+///
+/// Bounded on purpose: a builtin runs in the shell's own process, so an
+/// unbounded read would hand the terminal to a loop the user can only leave by
+/// killing the shell.
+fn stream_secs(host: &Host, args: &Value) -> u64 {
+    args.get("secs")
+        .and_then(Value::as_u64)
+        .or_else(|| cfg(host, "ZWIRE_STREAM_SECS").and_then(|s| s.parse().ok()))
+        .filter(|&n| n > 0)
+        .unwrap_or(30)
 }
 
 /// Correlation ids for this shell session. h: `proto::respond` copies `id` onto
@@ -337,6 +1709,17 @@ fn from_bus_reply(msg: &Value, reply: Value) -> Value {
 
 #[cfg(unix)]
 fn unix_request(sock: &std::path::Path, msg: &Value, id: u64, ms: u64) -> Result<Value, String> {
+    let stream = open_socket(sock, msg, ms)?;
+    read_reply(BufReader::new(stream).lines().map_while(Result::ok), id)
+}
+
+/// Connect, write the request line, and hand back the stream for reading.
+#[cfg(unix)]
+fn open_socket(
+    sock: &std::path::Path,
+    msg: &Value,
+    ms: u64,
+) -> Result<std::os::unix::net::UnixStream, String> {
     use std::os::unix::net::UnixStream;
     let stream =
         UnixStream::connect(sock).map_err(|e| format!("connect {}: {e}", sock.display()))?;
@@ -348,7 +1731,7 @@ fn unix_request(sock: &std::path::Path, msg: &Value, id: u64, ms: u64) -> Result
     line.push(b'\n');
     w.write_all(&line).map_err(|e| e.to_string())?;
     w.flush().map_err(|e| e.to_string())?;
-    read_reply(BufReader::new(stream).lines().map_while(Result::ok), id)
+    Ok(stream)
 }
 
 /// Fall back to the bundled client binary. `zwire-host call` prints the reply
@@ -386,6 +1769,53 @@ fn read_reply<I: Iterator<Item = String>>(lines: I, id: u64) -> Result<Value, St
     fallback.ok_or_else(|| "no reply from zwire-host".to_string())
 }
 
+/// Run a streaming command: print every frame, one compact JSON object per line,
+/// until `secs` elapses or the host hangs up.
+///
+/// Streams are only served by a connection that stays open, so this one holds
+/// the socket itself instead of going through [`request`]. The daemon socket is
+/// preferred here: the bus dispatcher answers a frame and moves on, so a
+/// subscription placed through it would never deliver anything.
+fn stream(host: &Host, mut msg: Value, secs: u64) -> c_int {
+    #[cfg(unix)]
+    {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if let Some(o) = msg.as_object_mut() {
+            o.insert("id".into(), json!(id));
+        }
+        let daemon = socket_path(host);
+        if !daemon.exists() {
+            return fail("streaming needs the NDJSON daemon: run `zwire-host serve`");
+        }
+        // A tick short enough to notice the deadline, long enough not to spin.
+        let sock = match open_socket(&daemon, &msg, 1000) {
+            Ok(s) => s,
+            Err(e) => return fail(&e),
+        };
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut lines = BufReader::new(sock).lines();
+        while Instant::now() < deadline {
+            match lines.next() {
+                Some(Ok(line)) => {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        host.print(&format!("{line}\n"));
+                    }
+                }
+                // A read timeout ends the iterator; the deadline decides whether
+                // that is "quiet" or "done".
+                Some(Err(_)) | None => continue,
+            }
+        }
+        0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, msg, secs);
+        fail("streaming is not supported on this platform")
+    }
+}
+
 /* ------------------------------------------------------------------ output */
 
 /// The host's own failure text, if the reply carries one.
@@ -420,8 +1850,7 @@ fn fail(msg: &str) -> c_int {
     1
 }
 
-/// Run one request and report it: `-` on failure, the named field (or the whole
-/// reply) on success.
+/// Run one request and report it: the named field (or the whole reply).
 fn run(host: &Host, msg: Value, field: Option<&str>) -> c_int {
     match request(host, msg) {
         Err(e) => fail(&e),
@@ -431,51 +1860,40 @@ fn run(host: &Host, msg: Value, field: Option<&str>) -> c_int {
             }
             match field {
                 Some(f) => show(host, v.get(f).unwrap_or(&Value::Null)),
-                None => show(host, &v),
+                None => show(host, &present(v)),
             }
             0
         }
     }
 }
 
-/// Call one automation verb. h: `session::handle_cmd` `"call"` →
-/// `zbus::call_verb`, which forwards a `browser.*` verb to the HUD worker.
-fn call_verb(host: &Host, verb: &str, args: Value, quiet: bool) -> c_int {
-    let msg = json!({ "cmd": "call", "verb": verb, "args": args });
-    match request(host, msg) {
-        Err(e) => fail(&e),
-        Ok(v) => {
-            if let Some(e) = reply_err(&v) {
-                return fail(&e);
-            }
-            // A `browser.*` reply is a delivery receipt, not a browser result:
-            // printing it on every `zwire tab new` would be noise. Structured
-            // results (a page read, a host command) still print.
-            let result = v.get("result").cloned().unwrap_or(Value::Null);
-            let receipt = result.get("action").is_some() && result.get("queued").is_some();
-            if !quiet && !receipt {
-                show(host, &result);
-            }
-            if receipt && result.get("delivered") == Some(&json!(0)) {
-                // Nothing subscribed: the daemon took the action but no browser
-                // is attached to run it. Say so rather than reporting success.
-                return fail("no zwire browser attached");
-            }
-            0
+/// A reply as a shell wants to read it.
+///
+/// Drops the envelope the protocol needs and the reader does not: `id` is this
+/// request's correlation number, and `ok` was already checked — printing either
+/// makes every answer something to pipe through `jq` before it is usable. A
+/// reply carrying exactly one field after that IS its answer (`which` → path,
+/// `kv_get` → value, `fs_home_dir` → data), so it is unwrapped; anything with
+/// more than one field is printed whole, because choosing among them would be
+/// guessing.
+fn present(v: Value) -> Value {
+    let Some(o) = v.as_object() else { return v };
+    let rest: Vec<(&String, &Value)> = o
+        .iter()
+        .filter(|(k, _)| k.as_str() != "ok" && k.as_str() != "id")
+        .collect();
+    match rest.as_slice() {
+        [(_, only)] => (*only).clone(),
+        _ => {
+            let mut m = o.clone();
+            m.remove("id");
+            m.remove("ok");
+            Value::Object(m)
         }
     }
 }
 
-/// Look a subcommand up in one of the verb tables.
-fn lookup(table: Table, sub: &str) -> Option<&'static str> {
-    let sub = sub.to_ascii_lowercase();
-    table.iter().find(|(k, _)| *k == sub).map(|(_, v)| *v)
-}
-
-/// The keys of a table, for an error message or a completion list.
-fn keys(table: Table) -> Vec<&'static str> {
-    table.iter().map(|(k, _)| *k).collect()
-}
+/* --------------------------------------------------------------- arguments */
 
 /// `k=v` → a JSON pair. The value parses as JSON when it can (`3`, `true`,
 /// `[1,2]`, `"x"`), so `zwire call browser.gotoTab index=3` sends a number, and
@@ -486,8 +1904,13 @@ fn kv(arg: &str) -> Option<(String, Value)> {
     if k.is_empty() {
         return None;
     }
-    let val = serde_json::from_str::<Value>(v).unwrap_or_else(|_| json!(v));
-    Some((k.to_string(), val))
+    Some((k.to_string(), scalar(v)))
+}
+
+/// One command-line word as a JSON value: parsed when it is valid JSON, a string
+/// otherwise. `3` is a number, `true` a bool, `https://…` a string.
+fn scalar(word: &str) -> Value {
+    serde_json::from_str::<Value>(word).unwrap_or_else(|_| json!(word))
 }
 
 /// Collect `k=v …` arguments into one object.
@@ -500,28 +1923,204 @@ fn kv_args(rest: &[String]) -> Result<Value, String> {
     Ok(Value::Object(o))
 }
 
-/* -------------------------------------------------------------- the builtin */
-
-fn help(host: &Host) -> c_int {
-    let mut s = String::from("usage: zwire <command> [args]\n\n");
-    for (name, doc) in SUBCOMMANDS {
-        s.push_str(&format!("  {name:<11}{doc}\n"));
+/// Bind a row's positional arguments, then merge whatever `k=v` words are left.
+///
+/// Positionals are taken from the FRONT, in order, before anything is treated as
+/// `k=v` — otherwise a value that happens to contain `=` (a URL with a query
+/// string, `fs write x 'a=b'`) would be read as a key.
+fn bind(spec: &[&str], rest: &[String]) -> Result<Value, String> {
+    let mut o = serde_json::Map::new();
+    let mut i = 0;
+    for name in spec {
+        if let Some(rest_name) = name.strip_prefix("**") {
+            // Everything left is the CALLED app's arguments, nested so they
+            // cannot collide with this command's own fields.
+            let inner = kv_args(&rest[i..])?;
+            o.insert(rest_name.to_string(), inner);
+            i = rest.len();
+            continue;
+        }
+        if let Some(list_name) = name.strip_prefix('*') {
+            let items: Vec<Value> = rest[i..].iter().map(|w| json!(w)).collect();
+            o.insert(list_name.to_string(), Value::Array(items));
+            i = rest.len();
+            continue;
+        }
+        let (key, optional) = match name.strip_suffix('?') {
+            Some(k) => (k, true),
+            None => (*name, false),
+        };
+        match rest.get(i) {
+            Some(w) => {
+                o.insert(key.to_string(), scalar(w));
+                i += 1;
+            }
+            None if optional => {}
+            None => return Err(format!("missing argument: {key}")),
+        }
     }
-    s.push_str("\ntab:   ");
-    s.push_str(&keys(TAB_VERBS).join(" "));
-    s.push_str("\nwin:   ");
-    s.push_str(&keys(WIN_VERBS).join(" "));
-    s.push_str("\nsnap:  ");
-    s.push_str(&keys(SNAP_VERBS).join(" "));
-    s.push_str("\nnav:   ");
-    s.push_str(&keys(NAV_VERBS).join(" "));
-    s.push_str("\nzoom:  ");
-    s.push_str(&keys(ZOOM_VERBS).join(" "));
-    s.push_str("\nclear: ");
-    s.push_str(&keys(CLEAR_VERBS).join(" "));
-    s.push_str("\npage:  ");
-    s.push_str(&PAGE_STATES.join(" "));
-    s.push_str(" | extract SELECTOR [ATTR]\n");
+    for a in &rest[i.min(rest.len())..] {
+        let (k, v) = kv(a).ok_or_else(|| format!("not a k=v argument: {a}"))?;
+        o.insert(k, v);
+    }
+    Ok(Value::Object(o))
+}
+
+/* -------------------------------------------------------------- dispatching */
+
+/// The row for `zwire <group> <name>`, if there is one.
+fn find(group: &str, name: &str) -> Option<&'static Sub> {
+    SUBS.iter().find(|s| s.group == group && s.name == name)
+}
+
+/// Every group name, in table order.
+fn groups() -> Vec<&'static str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for s in SUBS {
+        if !s.group.is_empty() && !seen.contains(&s.group) {
+            seen.push(s.group);
+        }
+    }
+    seen
+}
+
+/// The names inside one group.
+fn names(group: &str) -> Vec<&'static str> {
+    SUBS.iter()
+        .filter(|s| s.group == group)
+        .map(|s| s.name)
+        .collect()
+}
+
+/// Send one row.
+///
+/// The three verb families have three different reply shapes and this is the one
+/// place that knows it: a `browser.*` verb answers with a delivery receipt (the
+/// browser result never comes back over the native port), a `page.*` verb nests
+/// its answer under `result.value`, and a host command answers as itself.
+fn dispatch(host: &Host, sub: &Sub, rest: &[String]) -> c_int {
+    let args = match bind(sub.args, rest) {
+        Ok(a) => a,
+        Err(e) => return fail(&format!("{} {}: {e}", sub.group, sub.name)),
+    };
+    if sub.stream {
+        let secs = stream_secs(host, &args);
+        let mut msg = args;
+        if let Some(o) = msg.as_object_mut() {
+            o.remove("secs");
+            o.insert("cmd".into(), json!(sub.verb));
+        }
+        return stream(host, msg, secs);
+    }
+    if sub.verb.starts_with("browser.") {
+        return call_verb(host, sub.verb, args, true);
+    }
+    if sub.verb.starts_with("page.") {
+        return page_read(host, sub.verb, args);
+    }
+    let mut msg = args;
+    if let Some(o) = msg.as_object_mut() {
+        o.insert("cmd".into(), json!(sub.verb));
+    }
+    run(host, msg, None)
+}
+
+/// Call one automation verb. h: `session::handle_cmd` `"call"` →
+/// `zbus::call_verb`, which forwards a `browser.*` verb to the HUD worker.
+fn call_verb(host: &Host, verb: &str, args: Value, quiet: bool) -> c_int {
+    // `txn` rides at the TOP level of the frame, not inside `args` — both the
+    // `call` host command and the bus's `call` frame read it there (h:
+    // `session::handle_cmd` `msg["txn"]`, `zbus::serve_conn`). A user types it as
+    // one more `k=v`, so lift it, or the step would run outside the transaction
+    // it named and never be journaled.
+    let txn = args.get("txn").cloned();
+    let mut msg = json!({ "cmd": "call", "verb": verb, "args": args });
+    if let (Some(t), Some(o)) = (txn, msg.as_object_mut()) {
+        o.insert("txn".into(), t);
+    }
+    match request(host, msg) {
+        Err(e) => fail(&e),
+        Ok(v) => {
+            if let Some(e) = reply_err(&v) {
+                return fail(&e);
+            }
+            let result = v.get("result").cloned().unwrap_or(Value::Null);
+            // A `browser.*` reply is a delivery receipt, not a browser result:
+            // printing it on every `zwire tab new` would be noise. Structured
+            // results (a host command, a page read) still print.
+            let receipt = result.get("action").is_some() && result.get("queued").is_some();
+            if !quiet && !receipt {
+                show(host, &result);
+            }
+            if receipt && result.get("delivered") == Some(&json!(0)) {
+                // The action was journaled but no browser subscriber saw it —
+                // reporting success there would be a lie.
+                return fail("no zwire browser attached");
+            }
+            0
+        }
+    }
+}
+
+/// A `page.*` projection.
+///
+/// Sent as a `call` on the projection itself, never as `page_get`: the daemon
+/// answers a page read on its own thread (h: `session::spawn_page_reply`), and
+/// the bus's in-process dispatcher reads only the FIRST line a `Session` wrote —
+/// so `page_get` over the bus comes back "no reply from host session" while the
+/// answer is still in flight. `page.*` as a verb routes straight to
+/// `page::request` on both transports.
+fn page_read(host: &Host, verb: &str, args: Value) -> c_int {
+    match request(host, json!({ "cmd": "call", "verb": verb, "args": args })) {
+        Err(e) => fail(&e),
+        Ok(v) => {
+            if let Some(e) = reply_err(&v) {
+                return fail(&e);
+            }
+            // The verb's own reply: `{ok, state, value}` on success, `{ok:false,
+            // err}` when the browser is closed or refused the injection.
+            let r = v.get("result").cloned().unwrap_or(Value::Null);
+            if let Some(e) = reply_err(&r) {
+                return fail(&e);
+            }
+            match r.get("value") {
+                Some(val) => show(host, val),
+                // `assert` / `witness` answer with a verdict, not a value.
+                None => show(host, &present(r.clone())),
+            }
+            0
+        }
+    }
+}
+
+/* ------------------------------------------------------ the special commands */
+
+fn help(host: &Host, rest: &[String]) -> c_int {
+    // `help GROUP` — one group, with what each command does.
+    if let Some(g) = rest.first() {
+        let rows: Vec<&Sub> = SUBS.iter().filter(|s| s.group == g.as_str()).collect();
+        if rows.is_empty() {
+            return fail(&format!("no such group: {g}"));
+        }
+        let mut out = String::new();
+        for r in rows {
+            let args = r.args.join(" ");
+            out.push_str(&format!("  {:<12}{:<28}{}\n", r.name, args, r.doc));
+        }
+        host.print(&out);
+        return 0;
+    }
+    let mut s = String::from("usage: zwire <command> [args]\n\n");
+    for (name, doc) in SPECIAL {
+        s.push_str(&format!("  {name:<12}{doc}\n"));
+    }
+    for r in SUBS.iter().filter(|s| s.group.is_empty()) {
+        s.push_str(&format!("  {:<12}{}\n", r.name, r.doc));
+    }
+    s.push_str("\ngroups (zwire help GROUP):\n");
+    for g in groups() {
+        s.push_str(&format!("  {:<12}{}\n", g, names(g).join(" ")));
+    }
     host.print(&s);
     0
 }
@@ -545,26 +2144,22 @@ fn status(host: &Host) -> c_int {
     if let Some(e) = reply_err(&hello) {
         return fail(&e);
     }
-    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("-").to_string();
+    let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("-").to_string();
     let th = theme(host).unwrap_or(Value::Null);
     let light = th
         .get("ui")
         .and_then(|u| u.get("light"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let attached = request(host, json!({ "cmd": "page_states" }))
-        .ok()
-        .and_then(|v| v.get("serving").and_then(Value::as_bool))
-        .unwrap_or(false);
-    let endpoint = endpoint_path(host);
+    let attached = bus_path(host, "zwire-page").exists();
     host.print(&format!(
-        "host    {} {}\nscheme  {} ({})\nbrowser {}\nendpoint {}\n",
-        s(&hello, "host"),
-        s(&hello, "version"),
-        s(&th, "scheme"),
+        "host      {} {}\nscheme    {} ({})\nbrowser   {}\nendpoint  {}\n",
+        f(&hello, "host"),
+        f(&hello, "version"),
+        f(&th, "scheme"),
         if light { "light" } else { "dark" },
         if attached { "attached" } else { "not attached" },
-        endpoint.display(),
+        endpoint_path(host).display(),
     ));
     0
 }
@@ -585,9 +2180,7 @@ fn endpoint_path(host: &Host) -> PathBuf {
 /// `theme` is a command only on hosts that carry it. An older host answers
 /// `unknown_cmd`, and its one door onto the same write is the historical
 /// COMMANDLESS message — which the bus cannot carry (every bus frame names a
-/// verb), so the retry is only meaningful on the daemon socket. It costs one
-/// round trip and keeps this plugin working against a browser that has not been
-/// rebuilt yet.
+/// verb), so the retry is only meaningful on the daemon socket.
 fn theme_write(host: &Host, fields: Value, field: &str) -> c_int {
     let mut msg = fields.clone();
     if let Some(o) = msg.as_object_mut() {
@@ -597,9 +2190,6 @@ fn theme_write(host: &Host, fields: Value, field: &str) -> c_int {
         Err(e) => fail(&e),
         Ok(v) => {
             if v.get("err").and_then(Value::as_str) == Some("unknown_cmd") {
-                // Older host. The commandless message is the only other door,
-                // and only the NDJSON daemon can carry it — a bus frame always
-                // names a verb.
                 if socket_path(host).exists() {
                     return run(host, fields, Some(field));
                 }
@@ -645,69 +2235,27 @@ fn set_light(host: &Host, on: Option<bool>) -> c_int {
     theme_write(host, json!({ "ui": { "light": on } }), "ui")
 }
 
-/// `zwire page STATE [SELECTOR [ATTR]]` — the live DOM as typed state.
-///
-/// Sent as a `call` on the projection itself (`page.url`), never as `page_get`:
-/// the daemon answers a page read on its own thread (h: `session::spawn_page_reply`),
-/// and the bus's in-process dispatcher reads only the FIRST line a `Session`
-/// wrote — so `page_get` over the bus comes back "no reply from host session"
-/// while the answer is still in flight. `page.*` as a verb routes straight to
-/// `page::request` on both transports.
-fn page(host: &Host, rest: &[String]) -> c_int {
-    let Some(what) = rest.first() else {
-        host.print(&format!("{} extract\n", PAGE_STATES.join(" ")));
-        return 0;
-    };
-    let (state, args) = if what == "extract" {
-        let Some(sel) = rest.get(1) else {
-            return fail("page extract: needs a selector");
-        };
-        let mut a = json!({ "selector": sel });
-        if let Some(attr) = rest.get(2) {
-            a["attr"] = json!(attr);
-        }
-        ("page.extract".to_string(), a)
-    } else {
-        let id = format!("page.{what}");
-        if !PAGE_STATES.contains(&what.as_str()) {
-            return fail(&format!("unknown page state: {what}"));
-        }
-        (id, json!({}))
-    };
-    match request(host, json!({ "cmd": "call", "verb": state, "args": args })) {
-        Err(e) => fail(&e),
-        Ok(v) => {
-            if let Some(e) = reply_err(&v) {
-                return fail(&e);
-            }
-            // The verb's own reply: `{ok, state, value}` on success, `{ok:false,
-            // err}` when the browser is closed or refused the injection.
-            let r = v.get("result").cloned().unwrap_or(Value::Null);
-            if let Some(e) = reply_err(&r) {
-                return fail(&e);
-            }
-            show(host, r.get("value").unwrap_or(&Value::Null));
-            0
-        }
+/// The published automation surface, as `{id: rev}` rows.
+fn surface(host: &Host) -> Result<Vec<Value>, String> {
+    let v = request(host, json!({ "cmd": "verbs" }))?;
+    let list = v
+        .get("verbs")
+        .or_else(|| v.get("result").and_then(|r| r.get("verbs")))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if list.is_empty() {
+        return Err("no automation surface in the reply".into());
     }
+    Ok(list)
 }
 
-/// `zwire verbs [PATTERN]` — the published automation surface, one `id rev` per
-/// line. h: `zbus::surface`.
+/// `zwire verbs [PATTERN]` — one `id rev` per line. h: `zbus::surface`.
 fn verbs(host: &Host, rest: &[String]) -> c_int {
     let filter = rest.first().map(|s| s.to_ascii_lowercase());
-    match request(host, json!({ "cmd": "verbs" })) {
+    match surface(host) {
         Err(e) => fail(&e),
-        Ok(v) => {
-            let list = v
-                .get("verbs")
-                .or_else(|| v.get("result").and_then(|r| r.get("verbs")))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if list.is_empty() {
-                return fail("no automation surface in the reply");
-            }
+        Ok(list) => {
             let mut out = String::new();
             for e in &list {
                 let id = e.get("id").and_then(Value::as_str).unwrap_or("");
@@ -726,17 +2274,73 @@ fn verbs(host: &Host, rest: &[String]) -> c_int {
     }
 }
 
-/// A verb-table subcommand (`tab`, `win`, `snap`, `nav`, `zoom`, `clear`).
-fn table_cmd(host: &Host, group: &str, table: Table, rest: &[String], args: Value) -> c_int {
-    let Some(sub) = rest.first() else {
-        host.print(&format!("{}\n", keys(table).join(" ")));
-        return 0;
+/// `zwire audit` — every verb the RUNNING host publishes that no [`SUBS`] row
+/// names, and every row whose verb the host does not publish.
+///
+/// The point is that this table cannot quietly fall behind: the answer comes
+/// from the host that is actually running, not from a second copy of its list
+/// kept here. Exits non-zero when either side has something the other does not.
+fn audit(host: &Host) -> c_int {
+    let list = match surface(host) {
+        Ok(l) => l,
+        Err(e) => return fail(&e),
     };
-    match lookup(table, sub) {
-        Some(verb) => call_verb(host, &format!("browser.{verb}"), args, true),
-        None => fail(&format!("unknown {group} command: {sub}")),
+    let published: Vec<String> = list
+        .iter()
+        .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut out = String::new();
+    let mut bad = false;
+
+    for id in &published {
+        // `page_reply` / `page_serve` are the browser's own half of the page
+        // protocol — a shell has nothing to answer with, so they are excluded
+        // deliberately rather than missing.
+        if matches!(id.as_str(), "page_reply" | "page_serve" | "page_get") {
+            continue;
+        }
+        if !SUBS.iter().any(|s| s.verb == id) && !named_by_special(id) {
+            out.push_str(&format!("unnamed   {id}\n"));
+            bad = true;
+        }
     }
+    for s in SUBS {
+        if !published.iter().any(|p| p == s.verb) {
+            out.push_str(&format!("stale     {} {} → {}\n", s.group, s.name, s.verb));
+            bad = true;
+        }
+    }
+    if out.is_empty() {
+        host.print(&format!(
+            "{} verbs published, all reachable by name\n",
+            published.len()
+        ));
+        return 0;
+    }
+    host.print(&out);
+    c_int::from(bad)
 }
+
+/// Verbs a special command covers, so `audit` does not report them unnamed.
+fn named_by_special(verb: &str) -> bool {
+    matches!(
+        verb,
+        "hello"
+            | "get"
+            | "theme"
+            | "verbs"
+            | "clipboard_get"
+            | "clipboard_set"
+            | "browser.open"
+            | "browser.openTab"
+            | "browser.goBack"
+            | "browser.goForward"
+            | "browser.reload"
+            | "browser.reloadHard"
+    )
+}
+
+/* -------------------------------------------------------------- the builtin */
 
 fn zwire(host: &Host, args: &Args) -> c_int {
     let rest = args.rest();
@@ -745,8 +2349,9 @@ fn zwire(host: &Host, args: &Args) -> c_int {
     };
     let tail = &rest[1..];
     match cmd {
-        "help" | "-h" | "--help" => help(host),
+        "help" | "-h" | "--help" => help(host, tail),
         "status" => status(host),
+        "audit" => audit(host),
 
         "scheme" => scheme(host, tail),
         "schemes" => {
@@ -776,24 +2381,6 @@ fn zwire(host: &Host, args: &Args) -> c_int {
             }
             0
         }
-
-        "tab" => {
-            // `tab goto N` carries an index; every other tab verb is bare.
-            if tail.first().map(String::as_str) == Some("goto") {
-                let Some(n) = tail.get(1).and_then(|s| s.parse::<i64>().ok()) else {
-                    return fail("tab goto: needs an index");
-                };
-                return call_verb(host, "browser.gotoTab", json!({ "index": n }), true);
-            }
-            table_cmd(host, "tab", TAB_VERBS, tail, json!({}))
-        }
-        "win" | "window" => table_cmd(host, "win", WIN_VERBS, tail, json!({})),
-        "snap" => table_cmd(host, "snap", SNAP_VERBS, tail, json!({})),
-        "nav" => table_cmd(host, "nav", NAV_VERBS, tail, json!({})),
-        "zoom" => table_cmd(host, "zoom", ZOOM_VERBS, tail, json!({})),
-        "clear" => table_cmd(host, "clear", CLEAR_VERBS, tail, json!({})),
-
-        // The three navigation verbs worth a top-level name.
         "back" => call_verb(host, "browser.goBack", json!({}), true),
         "forward" => call_verb(host, "browser.goForward", json!({}), true),
         "reload" => {
@@ -805,22 +2392,6 @@ fn zwire(host: &Host, args: &Args) -> c_int {
             };
             call_verb(host, verb, json!({}), true)
         }
-
-        "bookmark" => call_verb(host, "browser.bookmarkTab", json!({}), true),
-        "download" => match tail.first() {
-            Some(url) => call_verb(host, "browser.download", json!({ "url": url }), true),
-            None => fail("download: needs a URL"),
-        },
-        "screenshot" => call_verb(host, "browser.screenshot", json!({}), true),
-        "notify" => match tail.first() {
-            Some(title) => call_verb(
-                host,
-                "browser.notify",
-                json!({ "title": title, "message": tail[1..].join(" ") }),
-                true,
-            ),
-            None => fail("notify: needs a title"),
-        },
 
         // Host-side, not browser-side: the clipboard belongs to the machine.
         "clip" => {
@@ -835,7 +2406,6 @@ fn zwire(host: &Host, args: &Args) -> c_int {
             }
         }
 
-        "page" => page(host, tail),
         "verbs" => verbs(host, tail),
 
         // Escape hatches: any verb, any host command.
@@ -855,15 +2425,31 @@ fn zwire(host: &Host, args: &Args) -> c_int {
             None => fail("raw: needs a JSON object"),
         },
 
-        other => fail(&format!("unknown command: {other}")),
+        // A top-level row, then a group.
+        other => {
+            if let Some(sub) = find("", other) {
+                return dispatch(host, sub, tail);
+            }
+            if !names(other).is_empty() {
+                let Some(name) = tail.first() else {
+                    host.print(&format!("{}\n", names(other).join(" ")));
+                    return 0;
+                };
+                return match find(other, name) {
+                    Some(sub) => dispatch(host, sub, &tail[1..]),
+                    None => fail(&format!("unknown {other} command: {name}")),
+                };
+            }
+            fail(&format!("unknown command: {other}"))
+        }
     }
 }
 
 /* ------------------------------------------------------------- completions */
 
 /// Native completion. The word list is `[CURRENT, word0, word1, …]` — see
-/// PLUGINS.md — so `words[1]` is the subcommand and `current` says which word
-/// is being completed.
+/// PLUGINS.md — so `words[1]` is the first argument and `current` says which
+/// word is being completed.
 fn zwire_complete(host: &Host, args: &Args) -> c_int {
     let a = args.rest();
     let current: usize = a.first().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -873,7 +2459,8 @@ fn zwire_complete(host: &Host, args: &Args) -> c_int {
         .and_then(|i| words.get(i))
         .map(String::as_str)
         .unwrap_or("");
-    let sub = words.get(1).map(String::as_str).unwrap_or("");
+    let first = words.get(1).map(String::as_str).unwrap_or("");
+    let second = words.get(2).map(String::as_str).unwrap_or("");
 
     let emit = |cands: Vec<&str>| {
         for c in cands {
@@ -883,56 +2470,89 @@ fn zwire_complete(host: &Host, args: &Args) -> c_int {
         }
     };
 
-    // Word 2 is the subcommand itself; later words complete per subcommand.
+    // Word 2 is the command or group; later words complete per command.
     if current <= 2 {
-        emit(SUBCOMMANDS.iter().map(|(k, _)| *k).collect());
+        let mut c: Vec<&str> = SPECIAL.iter().map(|(k, _)| *k).collect();
+        c.extend(names(""));
+        c.extend(groups());
+        emit(c);
         return 0;
     }
-    match sub {
-        "scheme" => emit(SCHEMES.to_vec()),
-        "tab" => {
-            let mut k = keys(TAB_VERBS);
-            k.push("goto");
-            emit(k);
+    if current == 3 {
+        match first {
+            "scheme" => emit(SCHEMES.to_vec()),
+            "help" => emit(groups()),
+            "reload" => emit(vec!["hard"]),
+            // The live surface, asked of the running host — so a verb added to
+            // zwire-host completes here the day it ships, with no table to update.
+            "call" | "verbs" => emit_surface(host, prefix),
+            g => emit(names(g)),
         }
-        "win" | "window" => emit(keys(WIN_VERBS)),
-        "snap" => emit(keys(SNAP_VERBS)),
-        "nav" => emit(keys(NAV_VERBS)),
-        "zoom" => emit(keys(ZOOM_VERBS)),
-        "clear" => emit(keys(CLEAR_VERBS)),
-        "page" => {
-            let mut k = PAGE_STATES.to_vec();
-            k.push("extract");
-            emit(k);
-        }
-        "reload" => emit(vec!["hard"]),
-        // The live surface, asked of the running host — so a verb added to
-        // zwire-host completes here the day it ships, with no table to update.
-        "call" | "verbs" => {
-            if let Ok(v) = request(host, json!({ "cmd": "verbs" })) {
-                let list = v
-                    .get("verbs")
-                    .or_else(|| v.get("result").and_then(|r| r.get("verbs")))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                for e in &list {
-                    if let Some(id) = e.get("id").and_then(Value::as_str) {
-                        if id.starts_with(prefix) {
-                            host.add_match(id);
-                        }
-                    }
-                }
+        return 0;
+    }
+    // Word 4+: the arguments of a known row.
+    match (first, second) {
+        ("page", "assert") | ("page", "witness") => {
+            if current == 4 {
+                emit(
+                    SUBS.iter()
+                        .filter(|s| s.group == "page" && s.verb.starts_with("page."))
+                        .map(|s| s.verb)
+                        .collect(),
+                );
+            } else if current == 5 {
+                emit(ASSERT_OPS.to_vec());
             }
         }
+        ("suite", "verbs") | ("suite", "call") | ("suite", "get") => {
+            if current == 4 {
+                emit_apps(host, prefix);
+            }
+        }
+        ("tmux", "hud") => emit(vec!["navigate", "split", "zoom"]),
         _ => {}
     }
     0
 }
 
+/// Candidates from the running host's surface.
+fn emit_surface(host: &Host, prefix: &str) {
+    if let Ok(list) = surface(host) {
+        for e in &list {
+            if let Some(id) = e.get("id").and_then(Value::as_str) {
+                if id.starts_with(prefix) {
+                    host.add_match(id);
+                }
+            }
+        }
+    }
+}
+
+/// Candidates from the suite apps that are actually running. h: `suite_list`
+/// proves each one by dialing it, so this never offers a dead socket.
+fn emit_apps(host: &Host, prefix: &str) {
+    let Ok(v) = request(host, json!({ "cmd": "suite_list" })) else {
+        return;
+    };
+    let apps = v
+        .get("apps")
+        .or_else(|| v.get("result").and_then(|r| r.get("apps")))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for a in &apps {
+        let name = a.as_str().or_else(|| a.get("app").and_then(Value::as_str));
+        if let Some(n) = name {
+            if n.starts_with(prefix) {
+                host.add_match(n);
+            }
+        }
+    }
+}
+
 declare_plugin! {
     name: "zwire",
-    version: "0.1.0",
+    version: "0.2.0",
     builtins: {
         "zwire" => zwire,
     },
@@ -962,85 +2582,132 @@ mod tests {
     }
 
     #[test]
-    fn kv_args_rejects_a_bare_word() {
-        assert!(kv_args(&["a=1".to_string()]).is_ok());
-        assert!(kv_args(&["oops".to_string()]).is_err());
+    fn positionals_bind_before_anything_is_read_as_a_key() {
+        let spec = &["path", "text"];
+        let rest = words(&["/tmp/x", "a=b", "mode=644"]);
+        let got = bind(spec, &rest).unwrap();
+        // `a=b` is the file's CONTENT, not a key: it was still positional.
+        assert_eq!(got["path"], json!("/tmp/x"));
+        assert_eq!(got["text"], json!("a=b"));
+        // Only what is left over is `k=v`.
+        assert_eq!(got["mode"], json!(644));
     }
 
     #[test]
-    fn verb_tables_are_case_insensitive_and_unique() {
-        assert_eq!(lookup(TAB_VERBS, "NEW"), Some("newTab"));
-        assert_eq!(lookup(TAB_VERBS, "dups"), Some("closeDuplicates"));
-        assert_eq!(lookup(WIN_VERBS, "full"), Some("fullscreenWindow"));
-        assert_eq!(lookup(SNAP_VERBS, "bottomright"), Some("snapBottomRight"));
-        assert_eq!(lookup(TAB_VERBS, "nope"), None);
-        for table in [
-            TAB_VERBS,
-            WIN_VERBS,
-            SNAP_VERBS,
-            NAV_VERBS,
-            ZOOM_VERBS,
-            CLEAR_VERBS,
-        ] {
-            let mut ks = keys(table);
-            let n = ks.len();
-            ks.sort_unstable();
-            ks.dedup();
-            assert_eq!(ks.len(), n, "duplicate subcommand in a verb table");
+    fn optional_positionals_may_be_absent_and_required_ones_may_not() {
+        assert_eq!(
+            bind(&["pid", "signal?"], &words(&["991"])).unwrap(),
+            json!({"pid": 991})
+        );
+        assert_eq!(
+            bind(&["pid", "signal?"], &words(&["991", "kill"])).unwrap(),
+            json!({"pid": 991, "signal": "kill"})
+        );
+        assert!(bind(&["pid"], &[])
+            .unwrap_err()
+            .contains("missing argument"));
+    }
+
+    #[test]
+    fn star_collects_a_list_and_double_star_a_nested_object() {
+        let got = bind(&["program", "*args"], &words(&["git", "status", "-s"])).unwrap();
+        assert_eq!(got, json!({"program": "git", "args": ["status", "-s"]}));
+        // A list keeps its words as STRINGS: `git log -n 5` must not send 5 as a
+        // number to a program that takes argv.
+        let n = bind(&["program", "*args"], &words(&["git", "-n", "5"])).unwrap();
+        assert_eq!(n["args"], json!(["-n", "5"]));
+
+        let call = bind(
+            &["app", "verb", "**args"],
+            &words(&["zcite", "item.add", "title=X", "year=1999"]),
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            json!({"app": "zcite", "verb": "item.add", "args": {"title": "X", "year": 1999}})
+        );
+    }
+
+    #[test]
+    fn every_row_is_addressable_and_unique() {
+        for s in SUBS {
+            assert!(!s.name.is_empty() && !s.verb.is_empty(), "empty row");
+            assert!(!s.doc.is_empty(), "{} {} has no doc", s.group, s.name);
+            assert_eq!(
+                find(s.group, s.name).map(|r| r.verb),
+                Some(s.verb),
+                "{} {} is shadowed by an earlier row",
+                s.group,
+                s.name
+            );
+        }
+        // A group name must not collide with a top-level command, or the
+        // dispatcher would never reach the group.
+        for g in groups() {
+            assert!(find("", g).is_none(), "group {g} shadows a top-level row");
+            assert!(
+                !SPECIAL.iter().any(|(k, _)| *k == g),
+                "group {g} shadows a special command"
+            );
+        }
+        for s in SUBS.iter().filter(|s| s.group.is_empty()) {
+            assert!(
+                !SPECIAL.iter().any(|(k, _)| *k == s.name),
+                "{} is both a row and a special command",
+                s.name
+            );
         }
     }
 
-    /// Every verb this plugin can name must exist on zwire-host's published
-    /// surface — the tables here are a spelling of `SURFACE_VERBS`, and a typo
-    /// would only show up as a silently ignored action in the browser.
     #[test]
-    fn every_table_verb_is_camel_cased_browser_action() {
-        for table in [
-            TAB_VERBS,
-            WIN_VERBS,
-            SNAP_VERBS,
-            NAV_VERBS,
-            ZOOM_VERBS,
-            CLEAR_VERBS,
-        ] {
-            for (sub, verb) in table {
-                assert!(!verb.is_empty(), "{sub} maps to an empty verb");
+    fn arg_specs_are_well_formed() {
+        for s in SUBS {
+            let mut seen_rest = false;
+            for a in s.args {
+                assert!(!seen_rest, "{} {}: nothing may follow {a}", s.group, s.name);
+                if a.starts_with('*') {
+                    seen_rest = true;
+                }
+                let bare = a.trim_start_matches('*').trim_end_matches('?');
                 assert!(
-                    verb.chars().all(|c| c.is_ascii_alphanumeric()),
-                    "{verb} is not a bare action name"
-                );
-                assert!(
-                    verb.starts_with(|c: char| c.is_ascii_lowercase()),
-                    "{verb} is not camelCase"
+                    !bare.is_empty() && bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "{} {}: odd argument name {a}",
+                    s.group,
+                    s.name
                 );
             }
         }
     }
 
+    /// The table's verbs must be spelled the way the host publishes them: a typo
+    /// in a `browser.*` action is silently ignored by the service worker, and a
+    /// typo in a host command comes back as `unknown_cmd` at the worst moment.
     #[test]
-    fn a_reply_is_matched_by_id_past_streaming_frames() {
-        let lines = [
-            r#"{"ev":"pub","topic":"scheme","data":{}}"#,
-            r#"{"ok":true,"id":7,"scheme":"matrix"}"#,
-        ]
-        .iter()
-        .map(|s| s.to_string());
-        let v = read_reply(lines, 7).unwrap();
-        assert_eq!(v["scheme"], json!("matrix"));
-    }
-
-    #[test]
-    fn an_unmatched_id_falls_back_to_the_first_non_event_frame() {
-        let lines = [
-            r#"{"ev":"line","data":"x"}"#,
-            r#"{"ok":true,"scheme":"ember"}"#,
-        ]
-        .iter()
-        .map(|s| s.to_string());
-        assert_eq!(read_reply(lines, 99).unwrap()["scheme"], json!("ember"));
-        // Nothing but event frames is not an answer.
-        let only_events = [r#"{"ev":"pub"}"#].iter().map(|s| s.to_string());
-        assert!(read_reply(only_events, 1).is_err());
+    fn verb_names_match_the_hosts_spelling_conventions() {
+        for s in SUBS {
+            if let Some(action) = s.verb.strip_prefix("browser.") {
+                assert!(
+                    action.chars().all(|c| c.is_ascii_alphanumeric())
+                        && action.starts_with(|c: char| c.is_ascii_lowercase()),
+                    "{} is not a camelCase browser action",
+                    s.verb
+                );
+            } else if let Some(state) = s.verb.strip_prefix("page.") {
+                assert!(
+                    state.chars().all(|c| c.is_ascii_lowercase()),
+                    "{} is not a page projection",
+                    s.verb
+                );
+            } else {
+                assert!(
+                    s.verb
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                    "{} is not a host command name",
+                    s.verb
+                );
+            }
+        }
     }
 
     #[test]
@@ -1064,13 +2731,11 @@ mod tests {
 
     #[test]
     fn a_bus_reply_is_normalised_into_daemon_shape() {
-        // A call's value is the verb's result and gets wrapped.
         let r = from_bus_reply(
             &json!({"cmd": "call", "verb": "page.url"}),
             json!({"t": "reply", "ok": true, "value": {"ok": true, "value": "u"}}),
         );
         assert_eq!(r, json!({"ok": true, "result": {"ok": true, "value": "u"}}));
-        // Any other command's value IS its reply.
         let g = from_bus_reply(
             &json!({"cmd": "get"}),
             json!({"t": "reply", "ok": true, "value": {"ok": true, "scheme": "toxic"}}),
@@ -1085,6 +2750,31 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_is_matched_by_id_past_streaming_frames() {
+        let lines = [
+            r#"{"ev":"pub","topic":"scheme","data":{}}"#,
+            r#"{"ok":true,"id":7,"scheme":"matrix"}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string());
+        let v = read_reply(lines, 7).unwrap();
+        assert_eq!(v["scheme"], json!("matrix"));
+    }
+
+    #[test]
+    fn an_unmatched_id_falls_back_to_the_first_non_event_frame() {
+        let lines = [
+            r#"{"ev":"line","data":"x"}"#,
+            r#"{"ok":true,"scheme":"ember"}"#,
+        ]
+        .iter()
+        .map(|s| s.to_string());
+        assert_eq!(read_reply(lines, 99).unwrap()["scheme"], json!("ember"));
+        let only_events = [r#"{"ev":"pub"}"#].iter().map(|s| s.to_string());
+        assert!(read_reply(only_events, 1).is_err());
+    }
+
+    #[test]
     fn reply_err_reads_the_hosts_own_reason() {
         assert_eq!(
             reply_err(&json!({"ok": false, "err": "bad_scheme"})).as_deref(),
@@ -1094,11 +2784,23 @@ mod tests {
         assert_eq!(reply_err(&json!({"ok": true})), None);
     }
 
+    /// Every family the bus publishes is represented, so "everything from the
+    /// bus" is checkable here and not only against a running host (`zwire audit`
+    /// is the live half of the same claim).
     #[test]
-    fn help_lists_every_subcommand() {
-        // The help text is built from SUBCOMMANDS, so this pins that the tables
-        // it appends stay non-empty rather than that the prose matches.
-        assert!(SUBCOMMANDS.iter().any(|(k, _)| *k == "page"));
-        assert!(!TAB_VERBS.is_empty() && !PAGE_STATES.is_empty());
+    fn the_table_covers_every_command_family() {
+        for prefix in [
+            "browser.", "page.", "fs_", "tmux_", "kv_", "hooks_", "job_", "suite_", "pty_",
+            "sysinfo", "txn_", "stryke", "peer", "watch_",
+        ] {
+            assert!(
+                SUBS.iter().any(|s| s.verb.starts_with(prefix)),
+                "no command reaches the {prefix}* family"
+            );
+        }
+    }
+
+    fn words(w: &[&str]) -> Vec<String> {
+        w.iter().map(|s| s.to_string()).collect()
     }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "zwire"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
-description = "Native zshrs plugin driving the zwire browser over zwire-host"
+description = "Native zshrs plugin: the whole zgui automation bus as a shell builtin"
 authors = ["MenkeTechnologies"]
 repository = "https://github.com/MenkeTechnologies/zshrs-zwire"
 homepage = "https://github.com/MenkeTechnologies/zshrs-zwire"
