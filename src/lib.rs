@@ -9,7 +9,7 @@
 //! live DOM as typed `page.*` state, and — through `suite_*` — dials the OTHER
 //! apps on the bus.
 //!
-//! This plugin puts every one of those on the command line. [`SUBS`] is the
+//! This plugin puts every one of those on the command line. `SUBS` is the
 //! whole named surface: one row per command, each naming the verb it sends and
 //! the arguments it binds positionally, so `zwire fs grep ~/src TODO`,
 //! `zwire tmux send %3 'make'`, `zwire suite call zcite item.add`, `zwire txn
@@ -17,7 +17,7 @@
 //! running host for its surface and prints anything not reachable by name — the
 //! table cannot silently fall behind the host it drives.
 //!
-//! See [`endpoints`] for which socket a request takes and why the order matters.
+//! See `endpoints` for which socket a request takes and why the order matters.
 //!
 //! Protocol citations (`h:`) refer to zwire-host's sources: `src/lib.rs`
 //! (`default_socket`), `src/session.rs` (`handle_cmd`, `theme_write`),
