@@ -13,7 +13,7 @@
 //! are shell builtins running native code, with no `curl`, no remote-debugging
 //! port and no client library.
 //!
-//! See [`endpoints`] for which socket a request takes and why the order matters.
+//! See `endpoints` for which socket a request takes and why the order matters.
 //!
 //! Protocol citations (`h:`) refer to zwire-host's sources: `src/lib.rs`
 //! (`default_socket`), `src/session.rs` (`handle_cmd`, `theme_write`),
