@@ -1,6 +1,6 @@
 [plugin]
 name = "zwire"
-version = "0.3.0"
+version = "0.3.1"
 description = "the whole zgui automation bus as a shell builtin: browser, page, filesystem, exec, tmux, hooks, suite apps"
 
 [native]

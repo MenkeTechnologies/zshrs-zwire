@@ -1,2 +1,4 @@
 /target
-Cargo.lock
+# The release workflow builds with --locked, so the lockfile has to ship. The
+# global gitignore excludes Cargo.lock; this un-excludes it for this repo.
+!Cargo.lock
