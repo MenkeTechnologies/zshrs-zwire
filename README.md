@@ -54,7 +54,7 @@ client library, no subprocess on the common path.
 ```text
 zwire                          → host, scheme, whether a browser is attached
 zwire scheme matrix            → recolour the browser, HUD and every themed app
-zwire tab new                  → 34 tab verbs; win, snap, nav, zoom, clear, dl, bm, hist, ext, power
+zwire tab new                  → tab verbs; win, snap, nav, zoom, clear, dl, bm, hist, ext, power
 zwire page tables              → the rendered page's tables, as JSON on stdout
 zwire fs grep ~/src TODO       → the machine: fs, exec, jobs, ps, kv, sysinfo, pty
 zwire tmux send 'make' %3      → the real tmux server, over tmux's own protocol
@@ -219,7 +219,7 @@ zwire pty run 'make -j8' secs=120      # spawn, type it, stream the output
 ## [0x07] AUDIT
 
 ```sh
-zwire audit     # → "247 verbs published, all reachable by name"
+zwire audit     # → "<n> verbs published, all reachable by name"
 ```
 
 `audit` asks the running host for its surface and prints anything not reachable
