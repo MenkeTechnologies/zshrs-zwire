@@ -2643,7 +2643,7 @@ fn emit_apps(host: &Host, prefix: &str) {
 
 declare_plugin! {
     name: "zwire",
-    version: "0.3.1",
+    version: "0.3.2",
     builtins: {
         "zwire" => zwire,
     },

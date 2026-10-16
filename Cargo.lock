@@ -105,13 +105,13 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "znative"
-version = "0.12.52"
+version = "0.13.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0047758d4a29de20bc35f258ef5da6c64fd258cf4e300cafa6485fee7f0a560"
+checksum = "1be5451e1175fd9d8760ab96404bd99a6373a9282ca91d38a6f065bbaf23d046"
 
 [[package]]
 name = "zwire"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64",
  "serde_json",
